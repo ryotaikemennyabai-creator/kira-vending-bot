@@ -377,5 +377,5 @@ async def on_ready():
 # 起動処理
 # ==========================================
 if __name__ == "__main__":
-    TOKEN = "YOUR_BOT_TOKEN_HERE"  # 👈 ここにトークンを貼り付けてください
+    TOKEN = "ここにあなたの本物のBot Tokenを貼り付ける"
     bot.run(TOKEN)
