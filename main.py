@@ -1,6 +1,6 @@
 import os
 import json
-import uuid
+import hashlib
 from datetime import datetime
 
 import discord
@@ -46,20 +46,8 @@ DEFAULT_CONFIG = {
 
 
 # =========================================================
-# データ読み込み・保存
+# JSON
 # =========================================================
-
-def load_json(filename, default):
-    if not os.path.exists(filename):
-        save_json(filename, default)
-        return default.copy()
-
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default.copy()
-
 
 def save_json(filename, data):
     with open(filename, "w", encoding="utf-8") as f:
@@ -71,9 +59,33 @@ def save_json(filename, data):
         )
 
 
-PRODUCTS = load_json(PRODUCT_FILE, DEFAULT_PRODUCTS)
-CONFIG = load_json(CONFIG_FILE, DEFAULT_CONFIG)
-ORDERS = load_json(ORDER_FILE, [])
+def load_json(filename, default):
+    if not os.path.exists(filename):
+        save_json(filename, default)
+        return default.copy()
+
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        save_json(filename, default)
+        return default.copy()
+
+
+PRODUCTS = load_json(
+    PRODUCT_FILE,
+    DEFAULT_PRODUCTS
+)
+
+CONFIG = load_json(
+    CONFIG_FILE,
+    DEFAULT_CONFIG
+)
+
+ORDERS = load_json(
+    ORDER_FILE,
+    []
+)
 
 
 # =========================================================
@@ -89,20 +101,35 @@ bot = commands.Bot(
 
 
 # =========================================================
-# 管理者チェック
+# 管理者判定
 # =========================================================
 
-def is_admin(interaction: discord.Interaction):
+def is_admin(interaction):
     return interaction.user.guild_permissions.administrator
 
 
 # =========================================================
-# Embed
+# 商品ボタン用ID
+# =========================================================
+
+def product_custom_id(product_name):
+    hashed = hashlib.sha256(
+        product_name.encode("utf-8")
+    ).hexdigest()[:16]
+
+    return f"kira_buy_{hashed}"
+
+
+# =========================================================
+# パネルEmbed
 # =========================================================
 
 def create_panel_embed():
 
-    color = CONFIG.get("panel_color", 0x5865F2)
+    color = CONFIG.get(
+        "panel_color",
+        0x5865F2
+    )
 
     embed = discord.Embed(
         title=CONFIG.get(
@@ -118,26 +145,31 @@ def create_panel_embed():
 
     if PRODUCTS:
 
-        text = ""
+        product_text = ""
 
         for name, data in PRODUCTS.items():
 
-            price = data.get("price", 0)
-            stock = data.get("stock", 0)
+            price = int(
+                data.get("price", 0)
+            )
 
-            if stock == 0:
+            stock = int(
+                data.get("stock", 0)
+            )
+
+            if stock <= 0:
                 status = "🔴 売り切れ"
             else:
                 status = f"🟢 残り {stock}個"
 
-            text += (
+            product_text += (
                 f"**{name}**\n"
                 f"💴 {price}円　{status}\n\n"
             )
 
         embed.add_field(
             name="📦 商品一覧",
-            value=text,
+            value=product_text[:1024],
             inline=False
         )
 
@@ -162,30 +194,48 @@ def create_panel_embed():
 
 def create_order_id():
 
-    order_id = f"KIRA-{len(ORDERS) + 1:05d}"
+    number = len(ORDERS) + 1
 
-    # 念のため重複確認
     existing = {
         order.get("order_id")
         for order in ORDERS
     }
 
-    while order_id in existing:
-        number = len(ORDERS) + 1
+    while True:
+
         order_id = f"KIRA-{number:05d}"
 
-    return order_id
+        if order_id not in existing:
+            return order_id
+
+        number += 1
 
 
 # =========================================================
-# 購入確認画面
+# 注文検索
+# =========================================================
+
+def find_order(order_id):
+
+    for order in ORDERS:
+
+        if order.get("order_id") == order_id:
+            return order
+
+    return None
+
+
+# =========================================================
+# 購入確認View
 # =========================================================
 
 class ConfirmPurchaseView(discord.ui.View):
 
     def __init__(self, product_name):
 
-        super().__init__(timeout=120)
+        super().__init__(
+            timeout=120
+        )
 
         self.product_name = product_name
 
@@ -200,16 +250,24 @@ class ConfirmPurchaseView(discord.ui.View):
         button: discord.ui.Button
     ):
 
-        product = PRODUCTS.get(self.product_name)
+        product = PRODUCTS.get(
+            self.product_name
+        )
 
         if not product:
+
             await interaction.response.send_message(
-                "❌ この商品は存在しません。",
+                "❌ この商品は現在販売されていません。",
                 ephemeral=True
             )
             return
 
-        if product.get("stock", 0) <= 0:
+        stock = int(
+            product.get("stock", 0)
+        )
+
+        if stock <= 0:
+
             await interaction.response.send_message(
                 "❌ この商品は売り切れです。",
                 ephemeral=True
@@ -217,7 +275,9 @@ class ConfirmPurchaseView(discord.ui.View):
             return
 
         await interaction.response.send_modal(
-            PurchaseModal(self.product_name)
+            PurchaseModal(
+                self.product_name
+            )
         )
 
     @discord.ui.button(
@@ -254,31 +314,42 @@ class PurchaseModal(discord.ui.Modal):
 
         self.url_input = discord.ui.TextInput(
             label="PayPay送金URL",
-            placeholder="PayPayの送金URLを貼り付けてください",
+            placeholder="PayPayの送金URLを入力してください",
             required=True,
             max_length=500
         )
 
-        self.add_item(self.url_input)
+        self.add_item(
+            self.url_input
+        )
 
     async def on_submit(
         self,
         interaction: discord.Interaction
     ):
 
-        product = PRODUCTS.get(self.product_name)
+        product = PRODUCTS.get(
+            self.product_name
+        )
 
         if not product:
+
             await interaction.response.send_message(
                 "❌ 商品が存在しません。",
                 ephemeral=True
             )
             return
 
-        price = product.get("price", 0)
-        stock = product.get("stock", 0)
+        price = int(
+            product.get("price", 0)
+        )
+
+        stock = int(
+            product.get("stock", 0)
+        )
 
         if stock <= 0:
+
             await interaction.response.send_message(
                 "❌ 売り切れになりました。",
                 ephemeral=True
@@ -287,7 +358,10 @@ class PurchaseModal(discord.ui.Modal):
 
         paypay_url = self.url_input.value.strip()
 
-        if not paypay_url.startswith("http"):
+        if not paypay_url.startswith(
+            ("http://", "https://")
+        ):
+
             await interaction.response.send_message(
                 "❌ 有効なURLを入力してください。",
                 ephemeral=True
@@ -308,13 +382,23 @@ class PurchaseModal(discord.ui.Modal):
         }
 
         ORDERS.append(order)
-        save_json(ORDER_FILE, ORDERS)
 
-        # 在庫を1減らす
-        product["stock"] = stock - 1
-        save_json(PRODUCT_FILE, PRODUCTS)
+        save_json(
+            ORDER_FILE,
+            ORDERS
+        )
 
-        # 購入者への表示
+        # 在庫を1個減らす
+        PRODUCTS[
+            self.product_name
+        ]["stock"] = stock - 1
+
+        save_json(
+            PRODUCT_FILE,
+            PRODUCTS
+        )
+
+        # 購入者へ表示
         await interaction.response.send_message(
             f"## ✅ 注文を受け付けました\n\n"
             f"**注文番号**\n"
@@ -323,12 +407,13 @@ class PurchaseModal(discord.ui.Modal):
             f"{self.product_name}\n\n"
             f"**価格**\n"
             f"{price}円\n\n"
-            f"現在の状態：**支払い確認待ち**\n\n"
+            f"**状態**\n"
+            f"🟡 支払い確認待ち\n\n"
             f"管理者が確認するまでお待ちください。",
             ephemeral=True
         )
 
-        # 注文通知
+        # 管理者チャンネルへ通知
         await send_order_notification(
             interaction.guild,
             order
@@ -336,86 +421,6 @@ class PurchaseModal(discord.ui.Modal):
 
         # 販売パネル更新
         await update_vending_panel()
-
-
-# =========================================================
-# 注文通知
-# =========================================================
-
-async def send_order_notification(
-    guild,
-    order
-):
-
-    if not guild:
-        return
-
-    channel_id = CONFIG.get(
-        "order_channel_id"
-    )
-
-    if not channel_id:
-        return
-
-    channel = guild.get_channel(
-        int(channel_id)
-    )
-
-    if not channel:
-        return
-
-    embed = discord.Embed(
-        title="🛒 新しい注文",
-        color=0xFEE75C
-    )
-
-    embed.add_field(
-        name="注文番号",
-        value=f"`{order['order_id']}`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="購入者",
-        value=(
-            f"<@{order['user_id']}>"
-            f"\n`{order['username']}`"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="商品",
-        value=order["product"],
-        inline=True
-    )
-
-    embed.add_field(
-        name="価格",
-        value=f"{order['price']}円",
-        inline=True
-    )
-
-    embed.add_field(
-        name="状態",
-        value="🟡 支払い確認待ち",
-        inline=False
-    )
-
-    embed.add_field(
-        name="PayPay送金URL",
-        value=order["paypay_url"],
-        inline=False
-    )
-
-    embed.set_footer(
-        text="管理画面から注文を処理できます"
-    )
-
-    await channel.send(
-        embed=embed,
-        view=OrderAdminView(order["order_id"])
-    )
 
 
 # =========================================================
@@ -432,17 +437,24 @@ class ProductButton(discord.ui.Button):
     ):
 
         if stock <= 0:
+
             label = f"{product_name}（売切）"
             style = discord.ButtonStyle.gray
+            disabled = True
+
         else:
+
             label = f"{product_name}｜{price}円"
             style = discord.ButtonStyle.green
+            disabled = False
 
         super().__init__(
             label=label[:80],
             style=style,
-            custom_id=f"kira_buy_{product_name}",
-            disabled=(stock <= 0)
+            disabled=disabled,
+            custom_id=product_custom_id(
+                product_name
+            )
         )
 
         self.product_name = product_name
@@ -457,20 +469,28 @@ class ProductButton(discord.ui.Button):
         )
 
         if not product:
+
             await interaction.response.send_message(
                 "❌ この商品は存在しません。",
                 ephemeral=True
             )
             return
 
-        if product.get("stock", 0) <= 0:
+        price = int(
+            product.get("price", 0)
+        )
+
+        stock = int(
+            product.get("stock", 0)
+        )
+
+        if stock <= 0:
+
             await interaction.response.send_message(
                 "❌ 売り切れです。",
                 ephemeral=True
             )
             return
-
-        price = product.get("price", 0)
 
         embed = discord.Embed(
             title="🛒 購入確認",
@@ -508,18 +528,17 @@ class VendingView(discord.ui.View):
             timeout=None
         )
 
+        # Discordの1Viewあたりのボタン上限25個
         for name, data in list(
             PRODUCTS.items()
-        ):
+        )[:25]:
 
-            price = data.get(
-                "price",
-                0
+            price = int(
+                data.get("price", 0)
             )
 
-            stock = data.get(
-                "stock",
-                0
+            stock = int(
+                data.get("stock", 0)
             )
 
             self.add_item(
@@ -529,6 +548,102 @@ class VendingView(discord.ui.View):
                     stock
                 )
             )
+
+
+# =========================================================
+# 注文通知
+# =========================================================
+
+async def send_order_notification(
+    guild,
+    order
+):
+
+    if guild is None:
+        return
+
+    channel_id = CONFIG.get(
+        "order_channel_id"
+    )
+
+    if not channel_id:
+        print(
+            "注文通知チャンネルが設定されていません。"
+        )
+        return
+
+    try:
+
+        channel = guild.get_channel(
+            int(channel_id)
+        )
+
+        if channel is None:
+
+            channel = await guild.fetch_channel(
+                int(channel_id)
+            )
+
+        embed = discord.Embed(
+            title="🛒 新しい注文",
+            color=0xFEE75C
+        )
+
+        embed.add_field(
+            name="注文番号",
+            value=f"`{order['order_id']}`",
+            inline=False
+        )
+
+        embed.add_field(
+            name="購入者",
+            value=(
+                f"<@{order['user_id']}>\n"
+                f"`{order['username']}`"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="商品",
+            value=order["product"],
+            inline=True
+        )
+
+        embed.add_field(
+            name="価格",
+            value=f"{order['price']}円",
+            inline=True
+        )
+
+        embed.add_field(
+            name="状態",
+            value="🟡 支払い確認待ち",
+            inline=False
+        )
+
+        embed.add_field(
+            name="PayPay送金URL",
+            value=order["paypay_url"],
+            inline=False
+        )
+
+        embed.set_footer(
+            text="下のボタンから注文を処理できます"
+        )
+
+        await channel.send(
+            embed=embed,
+            view=OrderAdminView(
+                order["order_id"]
+            )
+        )
+
+    except Exception as e:
+
+        print(
+            f"注文通知エラー: {e}"
+        )
 
 
 # =========================================================
@@ -554,8 +669,11 @@ async def update_vending_panel():
             int(channel_id)
         )
 
-        if not channel:
-            return
+        if channel is None:
+
+            channel = await bot.fetch_channel(
+                int(channel_id)
+            )
 
         message = await channel.fetch_message(
             int(message_id)
@@ -564,6 +682,12 @@ async def update_vending_panel():
         await message.edit(
             embed=create_panel_embed(),
             view=VendingView()
+        )
+
+    except discord.NotFound:
+
+        print(
+            "販売パネルのメッセージが見つかりません。"
         )
 
     except Exception as e:
@@ -593,7 +717,7 @@ class AddProductModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="価格",
+            label="価格（円）",
             placeholder="例：150",
             required=True,
             max_length=10
@@ -606,9 +730,17 @@ class AddProductModal(discord.ui.Modal):
             max_length=10
         )
 
-        self.add_item(self.name_input)
-        self.add_item(self.price_input)
-        self.add_item(self.stock_input)
+        self.add_item(
+            self.name_input
+        )
+
+        self.add_item(
+            self.price_input
+        )
+
+        self.add_item(
+            self.stock_input
+        )
 
     async def on_submit(
         self,
@@ -616,6 +748,7 @@ class AddProductModal(discord.ui.Modal):
     ):
 
         if not is_admin(interaction):
+
             await interaction.response.send_message(
                 "❌ 管理者専用です。",
                 ephemeral=True
@@ -625,6 +758,7 @@ class AddProductModal(discord.ui.Modal):
         name = self.name_input.value.strip()
 
         try:
+
             price = int(
                 self.price_input.value
             )
@@ -637,6 +771,14 @@ class AddProductModal(discord.ui.Modal):
 
             await interaction.response.send_message(
                 "❌ 価格と在庫は数字で入力してください。",
+                ephemeral=True
+            )
+            return
+
+        if not name:
+
+            await interaction.response.send_message(
+                "❌ 商品名を入力してください。",
                 ephemeral=True
             )
             return
@@ -695,10 +837,10 @@ class ProductSelect(discord.ui.Select):
 
             options.append(
                 discord.SelectOption(
-                    label=name,
+                    label=name[:100],
                     description=(
-                        f"{data.get('price', 0)}円 "
-                        f"/ 在庫 {data.get('stock', 0)}"
+                        f"{data.get('price', 0)}円 / "
+                        f"在庫 {data.get('stock', 0)}"
                     )[:100],
                     value=name
                 )
@@ -715,6 +857,7 @@ class ProductSelect(discord.ui.Select):
     ):
 
         if not is_admin(interaction):
+
             await interaction.response.send_message(
                 "❌ 管理者専用です。",
                 ephemeral=True
@@ -722,6 +865,14 @@ class ProductSelect(discord.ui.Select):
             return
 
         name = self.values[0]
+
+        if name not in PRODUCTS:
+
+            await interaction.response.send_message(
+                "❌ 商品が見つかりません。",
+                ephemeral=True
+            )
+            return
 
         if self.mode == "delete":
 
@@ -761,6 +912,7 @@ class ProductSelectView(discord.ui.View):
         )
 
         if PRODUCTS:
+
             self.add_item(
                 ProductSelect(mode)
             )
@@ -788,7 +940,7 @@ class EditProductModal(discord.ui.Modal):
         )
 
         self.price_input = discord.ui.TextInput(
-            label="価格",
+            label="価格（円）",
             default=str(
                 PRODUCTS[name]["price"]
             ),
@@ -796,24 +948,55 @@ class EditProductModal(discord.ui.Modal):
             max_length=10
         )
 
-        self.add_item(self.name_input)
-        self.add_item(self.price_input)
+        self.add_item(
+            self.name_input
+        )
+
+        self.add_item(
+            self.price_input
+        )
 
     async def on_submit(
         self,
         interaction: discord.Interaction
     ):
 
+        if not is_admin(interaction):
+
+            await interaction.response.send_message(
+                "❌ 管理者専用です。",
+                ephemeral=True
+            )
+            return
+
         new_name = self.name_input.value.strip()
 
         try:
+
             new_price = int(
                 self.price_input.value
             )
+
         except ValueError:
 
             await interaction.response.send_message(
                 "❌ 価格は数字で入力してください。",
+                ephemeral=True
+            )
+            return
+
+        if new_price <= 0:
+
+            await interaction.response.send_message(
+                "❌ 価格は1円以上にしてください。",
+                ephemeral=True
+            )
+            return
+
+        if not new_name:
+
+            await interaction.response.send_message(
+                "❌ 商品名を入力してください。",
                 ephemeral=True
             )
             return
@@ -838,7 +1021,7 @@ class EditProductModal(discord.ui.Modal):
         )
 
         await interaction.response.send_message(
-            "✅ 商品を更新しました。",
+            f"✅ **{new_name}** に更新しました。",
             ephemeral=True
         )
 
@@ -864,7 +1047,8 @@ class StockModal(discord.ui.Modal):
             default=str(
                 PRODUCTS[name]["stock"]
             ),
-            required=True
+            required=True,
+            max_length=10
         )
 
         self.add_item(
@@ -876,10 +1060,20 @@ class StockModal(discord.ui.Modal):
         interaction: discord.Interaction
     ):
 
+        if not is_admin(interaction):
+
+            await interaction.response.send_message(
+                "❌ 管理者専用です。",
+                ephemeral=True
+            )
+            return
+
         try:
+
             stock = int(
                 self.stock_input.value
             )
+
         except ValueError:
 
             await interaction.response.send_message(
@@ -891,7 +1085,15 @@ class StockModal(discord.ui.Modal):
         if stock < 0:
 
             await interaction.response.send_message(
-                "❌ 在庫は0以上です。",
+                "❌ 在庫は0以上にしてください。",
+                ephemeral=True
+            )
+            return
+
+        if self.name not in PRODUCTS:
+
+            await interaction.response.send_message(
+                "❌ 商品が見つかりません。",
                 ephemeral=True
             )
             return
@@ -906,8 +1108,8 @@ class StockModal(discord.ui.Modal):
         )
 
         await interaction.response.send_message(
-            f"✅ **{self.name}** の在庫を "
-            f"{stock}個に変更しました。",
+            f"✅ **{self.name}** の在庫を"
+            f" **{stock}個** に変更しました。",
             ephemeral=True
         )
 
@@ -972,6 +1174,14 @@ class PanelSettingsModal(discord.ui.Modal):
         interaction: discord.Interaction
     ):
 
+        if not is_admin(interaction):
+
+            await interaction.response.send_message(
+                "❌ 管理者専用です。",
+                ephemeral=True
+            )
+            return
+
         color_text = self.color_input.value.strip()
 
         try:
@@ -1008,7 +1218,7 @@ class PanelSettingsModal(discord.ui.Modal):
         )
 
         await interaction.response.send_message(
-            "✅ 販売パネルの設定を変更しました。",
+            "✅ 販売パネルを更新しました。",
             ephemeral=True
         )
 
@@ -1016,7 +1226,7 @@ class PanelSettingsModal(discord.ui.Modal):
 
 
 # =========================================================
-# 注文処理
+# 注文管理
 # =========================================================
 
 class OrderAdminView(discord.ui.View):
@@ -1041,6 +1251,7 @@ class OrderAdminView(discord.ui.View):
     ):
 
         if not is_admin(interaction):
+
             await interaction.response.send_message(
                 "❌ 管理者専用です。",
                 ephemeral=True
@@ -1052,8 +1263,17 @@ class OrderAdminView(discord.ui.View):
         )
 
         if not order:
+
             await interaction.response.send_message(
                 "❌ 注文が見つかりません。",
+                ephemeral=True
+            )
+            return
+
+        if order["status"] != "支払い確認待ち":
+
+            await interaction.response.send_message(
+                "❌ この注文はすでに処理されています。",
                 ephemeral=True
             )
             return
@@ -1075,6 +1295,7 @@ class OrderAdminView(discord.ui.View):
             view=OrderCompletedView()
         )
 
+        # 購入者へDM
         try:
 
             user = await bot.fetch_user(
@@ -1082,14 +1303,17 @@ class OrderAdminView(discord.ui.View):
             )
 
             await user.send(
-                f"✅ 注文 `{self.order_id}` の"
+                f"✅ **注文 `{self.order_id}`**\n\n"
                 f"支払いが確認されました！\n\n"
                 f"商品：{order['product']}\n"
                 f"価格：{order['price']}円"
             )
 
-        except Exception:
-            pass
+        except Exception as e:
+
+            print(
+                f"購入者DM送信エラー: {e}"
+            )
 
     @discord.ui.button(
         label="キャンセル",
@@ -1103,6 +1327,7 @@ class OrderAdminView(discord.ui.View):
     ):
 
         if not is_admin(interaction):
+
             await interaction.response.send_message(
                 "❌ 管理者専用です。",
                 ephemeral=True
@@ -1114,8 +1339,17 @@ class OrderAdminView(discord.ui.View):
         )
 
         if not order:
+
             await interaction.response.send_message(
                 "❌ 注文が見つかりません。",
+                ephemeral=True
+            )
+            return
+
+        if order["status"] != "支払い確認待ち":
+
+            await interaction.response.send_message(
+                "❌ この注文はすでに処理されています。",
                 ephemeral=True
             )
             return
@@ -1128,8 +1362,14 @@ class OrderAdminView(discord.ui.View):
         )
 
         if product:
+
             product["stock"] = (
-                product.get("stock", 0) + 1
+                int(
+                    product.get(
+                        "stock",
+                        0
+                    )
+                ) + 1
             )
 
             save_json(
@@ -1143,7 +1383,8 @@ class OrderAdminView(discord.ui.View):
         )
 
         await interaction.response.send_message(
-            f"❌ `{self.order_id}` をキャンセルしました。",
+            f"❌ `{self.order_id}` を"
+            f"キャンセルしました。",
             ephemeral=True
         )
 
@@ -1162,226 +1403,12 @@ class OrderCompletedView(discord.ui.View):
             timeout=None
         )
 
-    @discord.ui.button(
-        label="処理済み",
-        style=discord.ButtonStyle.gray,
-        disabled=True
-    )
-    async def done(
-        self,
-        interaction,
-        button
-    ):
-        pass
-
-
-def find_order(order_id):
-
-    for order in ORDERS:
-
-        if order.get(
-            "order_id"
-        ) == order_id:
-
-            return order
-
-    return None
-
-
-# =========================================================
-# 管理画面
-# =========================================================
-
-class AdminView(discord.ui.View):
-
-    @discord.ui.button(
-        label="🛒 自動販売機を設置",
-        style=discord.ButtonStyle.green,
-        row=0
-    )
-    async def install(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ 管理者専用です。",
-                ephemeral=True
+        self.add_item(
+            discord.ui.Button(
+                label="処理済み",
+                style=discord.ButtonStyle.gray,
+                disabled=True
             )
-            return
-
-        await interaction.response.send_message(
-            "販売パネルを設置するチャンネルを選択してください。",
-            view=ChannelSelectView(
-                "purchase"
-            ),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="📩 注文通知チャンネル",
-        style=discord.ButtonStyle.blurple,
-        row=0
-    )
-    async def set_order_channel(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "❌ 管理者専用です。",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "注文通知を送るチャンネルを選択してください。",
-            view=ChannelSelectView(
-                "order"
-            ),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="➕ 商品追加",
-        style=discord.ButtonStyle.green,
-        row=1
-    )
-    async def add(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        await interaction.response.send_modal(
-            AddProductModal()
-        )
-
-    @discord.ui.button(
-        label="✏️ 商品編集",
-        style=discord.ButtonStyle.blurple,
-        row=1
-    )
-    async def edit(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        if not PRODUCTS:
-            await interaction.response.send_message(
-                "商品がありません。",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "編集する商品を選択してください。",
-            view=ProductSelectView("edit"),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="🗑️ 商品削除",
-        style=discord.ButtonStyle.red,
-        row=1
-    )
-    async def delete(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        if not PRODUCTS:
-            await interaction.response.send_message(
-                "商品がありません。",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "削除する商品を選択してください。",
-            view=ProductSelectView("delete"),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="📦 在庫変更",
-        style=discord.ButtonStyle.gray,
-        row=2
-    )
-    async def stock(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        if not PRODUCTS:
-            await interaction.response.send_message(
-                "商品がありません。",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            "在庫を変更する商品を選択してください。",
-            view=ProductSelectView("stock"),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="🎨 パネル設定",
-        style=discord.ButtonStyle.blurple,
-        row=2
-    )
-    async def settings(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        await interaction.response.send_modal(
-            PanelSettingsModal()
-        )
-
-    @discord.ui.button(
-        label="🔄 パネル更新",
-        style=discord.ButtonStyle.gray,
-        row=2
-    )
-    async def refresh(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        if not is_admin(interaction):
-            return
-
-        await update_vending_panel()
-
-        await interaction.response.send_message(
-            "✅ 販売パネルを更新しました。",
-            ephemeral=True
         )
 
 
@@ -1408,45 +1435,91 @@ class ChannelSelect(discord.ui.ChannelSelect):
     ):
 
         if not is_admin(interaction):
+
             await interaction.response.send_message(
                 "❌ 管理者専用です。",
                 ephemeral=True
             )
             return
 
-        channel = self.values[0]
+        # Discordの選択結果は
+        # AppCommandChannelになる場合があるため、
+        # IDから本物のチャンネルを取得する
+        selected_channel = self.values[0]
 
-        if self.mode == "purchase":
+        try:
 
-            CONFIG[
-                "purchase_channel_id"
-            ] = channel.id
-
-            save_json(
-                CONFIG_FILE,
-                CONFIG
+            channel = await interaction.guild.fetch_channel(
+                selected_channel.id
             )
 
-            # 新しいパネルを送信
-            message = await channel.send(
-                embed=create_panel_embed(),
-                view=VendingView()
-            )
+        except Exception as e:
 
-            CONFIG[
-                "panel_message_id"
-            ] = message.id
-
-            save_json(
-                CONFIG_FILE,
-                CONFIG
+            print(
+                f"チャンネル取得エラー: {e}"
             )
 
             await interaction.response.send_message(
-                f"✅ {channel.mention} に"
-                f"自動販売機を設置しました！",
+                "❌ チャンネルを取得できませんでした。",
                 ephemeral=True
             )
+            return
+
+        # =================================================
+        # 購入チャンネル
+        # =================================================
+
+        if self.mode == "purchase":
+
+            try:
+
+                # 新しいチャンネルへパネルを設置
+                message = await channel.send(
+                    embed=create_panel_embed(),
+                    view=VendingView()
+                )
+
+                CONFIG[
+                    "purchase_channel_id"
+                ] = channel.id
+
+                CONFIG[
+                    "panel_message_id"
+                ] = message.id
+
+                save_json(
+                    CONFIG_FILE,
+                    CONFIG
+                )
+
+                await interaction.response.send_message(
+                    f"✅ {channel.mention} に"
+                    f"自動販売機を設置しました！",
+                    ephemeral=True
+                )
+
+            except discord.Forbidden:
+
+                await interaction.response.send_message(
+                    "❌ このチャンネルにBotが"
+                    "メッセージを送信できません。",
+                    ephemeral=True
+                )
+
+            except Exception as e:
+
+                print(
+                    f"パネル設置エラー: {e}"
+                )
+
+                await interaction.response.send_message(
+                    "❌ パネル設置中にエラーが発生しました。",
+                    ephemeral=True
+                )
+
+        # =================================================
+        # 注文通知チャンネル
+        # =================================================
 
         elif self.mode == "order":
 
@@ -1480,7 +1553,205 @@ class ChannelSelectView(discord.ui.View):
 
 
 # =========================================================
-# 起動時
+# 管理画面
+# =========================================================
+
+class AdminView(discord.ui.View):
+
+    @discord.ui.button(
+        label="🛒 自動販売機を設置",
+        style=discord.ButtonStyle.green,
+        row=0
+    )
+    async def install(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        await interaction.response.send_message(
+            "販売パネルを設置するチャンネルを選択してください。",
+            view=ChannelSelectView(
+                "purchase"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="📩 注文通知チャンネル",
+        style=discord.ButtonStyle.blurple,
+        row=0
+    )
+    async def set_order_channel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        await interaction.response.send_message(
+            "注文通知を送るチャンネルを選択してください。",
+            view=ChannelSelectView(
+                "order"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="➕ 商品追加",
+        style=discord.ButtonStyle.green,
+        row=1
+    )
+    async def add_product(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        await interaction.response.send_modal(
+            AddProductModal()
+        )
+
+    @discord.ui.button(
+        label="✏️ 商品編集",
+        style=discord.ButtonStyle.blurple,
+        row=1
+    )
+    async def edit_product(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        if not PRODUCTS:
+
+            await interaction.response.send_message(
+                "❌ 商品がありません。",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "編集する商品を選択してください。",
+            view=ProductSelectView(
+                "edit"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="🗑️ 商品削除",
+        style=discord.ButtonStyle.red,
+        row=1
+    )
+    async def delete_product(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        if not PRODUCTS:
+
+            await interaction.response.send_message(
+                "❌ 商品がありません。",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "削除する商品を選択してください。",
+            view=ProductSelectView(
+                "delete"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="📦 在庫変更",
+        style=discord.ButtonStyle.gray,
+        row=2
+    )
+    async def change_stock(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        if not PRODUCTS:
+
+            await interaction.response.send_message(
+                "❌ 商品がありません。",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "在庫を変更する商品を選択してください。",
+            view=ProductSelectView(
+                "stock"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="🎨 パネル設定",
+        style=discord.ButtonStyle.blurple,
+        row=2
+    )
+    async def panel_settings(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        await interaction.response.send_modal(
+            PanelSettingsModal()
+        )
+
+    @discord.ui.button(
+        label="🔄 パネル更新",
+        style=discord.ButtonStyle.gray,
+        row=2
+    )
+    async def refresh_panel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        if not is_admin(interaction):
+            return
+
+        await update_vending_panel()
+
+        await interaction.response.send_message(
+            "✅ 販売パネルを更新しました。",
+            ephemeral=True
+        )
+
+
+# =========================================================
+# Bot起動前の永続View登録
 # =========================================================
 
 @bot.event
@@ -1489,22 +1760,6 @@ async def on_ready():
     print(
         f"ログインしました: {bot.user}"
     )
-
-    # 永続View
-    bot.add_view(
-        VendingView()
-    )
-
-    # 注文ボタン
-    for order in ORDERS:
-
-        if order.get("status") == "支払い確認待ち":
-
-            bot.add_view(
-                OrderAdminView(
-                    order["order_id"]
-                )
-            )
 
     try:
 
@@ -1555,17 +1810,16 @@ async def admin(
     if not is_admin(interaction):
 
         await interaction.response.send_message(
-            "❌ 管理者専用です。",
+            "❌ この画面は管理者専用です。",
             ephemeral=True
         )
-
         return
 
     embed = discord.Embed(
         title="👑 キラの自動販売機",
         description=(
             "管理者コントロールパネル\n\n"
-            "ここから商品・在庫・販売パネルなどを管理できます。"
+            "商品・在庫・販売パネル・注文通知を管理できます。"
         ),
         color=CONFIG.get(
             "panel_color",
@@ -1594,5 +1848,9 @@ if not TOKEN:
         "DISCORD_TOKEN が設定されていません。"
     )
 
+
+# =========================================================
+# 起動
+# =========================================================
 
 bot.run(TOKEN)
