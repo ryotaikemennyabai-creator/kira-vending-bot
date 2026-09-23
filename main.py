@@ -596,5 +596,5 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    TOKEN = "YOUR_BOT_TOKEN_HERE"  # 👈 一番下のここをご自身のBotトークンに変更してください
+    TOKEN = "MTAxMjM0NTY3ODkwMTIzNDU2Nw.G..."  # コピーした実際のトークン
     bot.run(TOKEN)
