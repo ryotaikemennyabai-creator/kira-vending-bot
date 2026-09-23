@@ -14,16 +14,10 @@ from discord.ext import commands
 CONFIG_FILE = "config.json"
 SHOP_FILE = "shop.json"
 
-# PayPay送金URL判定用
 PAYPAY_URL_PATTERN = re.compile(r"^https://(paypay\.ne\.jp|paypay\.me)/(page/link/[A-Za-z0-9_]+|[A-Za-z0-9_]+)$")
-
-# 排他制御用
 data_lock = asyncio.Lock()
 
 
-# ==========================================
-# JSONヘルパー関数
-# ==========================================
 def load_json(filepath: str, default_data: Any) -> Any:
     if not os.path.exists(filepath):
         save_json(filepath, default_data)
@@ -602,5 +596,5 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    TOKEN = "YOUR_BOT_TOKEN_HERE"  # 👈 ここにご自身のBotトークンを入れてください
+    TOKEN = "YOUR_BOT_TOKEN_HERE"  # 👈 一番下のここをご自身のBotトークンに変更してください
     bot.run(TOKEN)
