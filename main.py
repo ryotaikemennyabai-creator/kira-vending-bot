@@ -377,5 +377,12 @@ async def on_ready():
 # 起動処理
 # ==========================================
 if __name__ == "__main__":
-    TOKEN = "ここにあなたの本物のBot Tokenを貼り付ける"
+    TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+
+    if not TOKEN:
+        TOKEN = input("Discord Bot Tokenを入力してください: ").strip()
+
+    if not TOKEN:
+        raise RuntimeError("Discord Bot Tokenが入力されていません。")
+
     bot.run(TOKEN)
