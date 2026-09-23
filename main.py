@@ -596,5 +596,17 @@ async def on_ready():
 
 
 if __name__ == "__main__":
-    TOKEN = "MTAxMjM0NTY3ODkwMTIzNDU2Nw.G..."  # コピーした実際のトークン
-    bot.run(TOKEN)
+    # 環境変数（DISCORD_TOKEN または TOKEN）を取得
+    token = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN")
+    
+    # 環境変数がない場合は直接入力を求める（※コード内に書き込まないで済む安全対策）
+    if not token:
+        print("--------------------------------------------------")
+        print("【提示】環境変数にBotトークンが見つかりませんでした。")
+        token = input("Botのトークンを貼り付けてEnterを押してください: ").strip()
+        print("--------------------------------------------------")
+
+    if token:
+        bot.run(token)
+    else:
+        print("❌ トークンが入力されなかったため起動を中止しました。")
