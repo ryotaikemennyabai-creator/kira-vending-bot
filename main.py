@@ -125,3 +125,4 @@ if __name__ == "__main__":
         raise RuntimeError("DISCORD_TOKEN が設定されていません。")
 
     bot.run(token)
+
