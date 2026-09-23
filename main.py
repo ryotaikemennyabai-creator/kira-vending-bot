@@ -9,15 +9,22 @@ from discord import app_commands
 from discord.ext import commands
 
 # ==========================================
+# 🔑 Botトークン設定（最優先）
+# ==========================================
+# ※ここにDiscord Developer Portalの「Bot」タブで発行したトークンを貼り付けてください。
+# ※環境変数 DISCORD_TOKEN が設定されている場合は、自動的にそちらが優先されます。
+TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+# ==========================================
 # ファイル設定 & 定数設定
 # ==========================================
 CONFIG_FILE = "config.json"
 SHOP_FILE = "shop.json"
 
-# PayPay送金URLの正規表現（厳格化）
+# PayPay送金URLの正規表現（厳格判定）
 PAYPAY_URL_PATTERN = re.compile(r"^https://(paypay\.ne\.jp|paypay\.me)/(page/link/[A-Za-z0-9_]+|[A-Za-z0-9_]+)$")
 
-# 排他制御用ロック（データ破損防止）
+# 排他制御用ロック（データ破損・二重納品防止）
 data_lock = asyncio.Lock()
 
 
@@ -93,13 +100,13 @@ class VendBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # 永続View・DynamicItemの登録
+        # 永続View・DynamicItemの再登録（Bot再起動時対策）
         self.add_view(ShopPanelView())
         self.add_dynamic_items(TicketPayButton)
         self.add_dynamic_items(AdminApproveButton)
         self.add_dynamic_items(AdminRejectButton)
         self.add_dynamic_items(CloseTicketButton)
-        print("[System] UIコンポーネントおよびDynamicItemを正常に再登録しました。")
+        print("[System] UIコンポーネントおよびDynamicItemを正常に登録しました。")
 
 
 bot = VendBot()
@@ -320,7 +327,6 @@ class TicketPayButton(discord.ui.DynamicItem[discord.ui.Button], template=r"btn_
         )
         self.ticket_id = ticket_id
 
-    # DynamicItemの引数再構築処理
     @classmethod
     async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
         return cls(ticket_id=match.group("ticket_id"))
@@ -400,7 +406,7 @@ class AdminApproveButton(discord.ui.DynamicItem[discord.ui.Button], template=r"b
             if buyer:
                 await buyer.send(embed=delivery_embed)
         except Exception:
-            pass # DMが閉じられている場合はスキップ
+            pass # DM受信が拒否されている場合はスキップ
 
         # ログチャンネルへの結果記録
         log_channel_id = config_data.get("log_channel_id")
@@ -665,8 +671,25 @@ async def on_ready():
 
 
 # ==========================================
-# Bot 起動用メインエントリー
+# Bot 起動用メインエントリー (安全起動ロジック)
 # ==========================================
 if __name__ == "__main__":
-    TOKEN = "YOUR_BOT_TOKEN_HERE"  # ご自身のDiscord Botトークンに置き換えてください
-    bot.run(TOKEN)
+    # 環境変数 DISCORD_TOKEN が設定されている場合は優先、なければコード内の TOKEN を使用
+    env_token = os.getenv("DISCORD_TOKEN")
+    target_token = env_token if env_token else TOKEN
+
+    # 余計な空白・改行・引用符の強制除去（ログイン失敗対策）
+    clean_token = target_token.strip().replace(" ", "").replace("\n", "").replace("\r", "").replace('"', '').replace("'", "")
+
+    if not clean_token or clean_token == "YOUR_BOT_TOKEN_HERE":
+        print("❌ 【エラー】Botトークンが指定されていません。")
+        print("コード最上部の TOKEN = \"...\" にトークンを書き込むか、export DISCORD_TOKEN=\"...\" をセットしてください。")
+    else:
+        print(f"[System] トークンを検出しました（文字数: {len(clean_token)} 文字）。Botへログインを試みます...")
+        try:
+            bot.run(clean_token)
+        except discord.errors.LoginFailure:
+            print("\n❌ 【ログイン失敗】トークンが拒否されました（401 Unauthorized）。")
+            print("Developer Portal の「Bot」タブにて「Reset Token」で取得した最新トークンか再確認してください。")
+        except Exception as e:
+            print(f"\n❌ 【起動エラー】: {e}")
