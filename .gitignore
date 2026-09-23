@@ -1,0 +1,186 @@
+import os
+import uuid
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from paypayopa import Client
+
+logging.basicConfig(level=logging.INFO)
+
+# =========================
+# 商品
+# =========================
+PRODUCTS = {
+    "cola": {"name": "コーラ", "price": 100},
+    "tea": {"name": "お茶", "price": 100},
+    "water": {"name": "水", "price": 80},
+}
+
+# =========================
+# Discord Bot
+# =========================
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        logging.info("ログイン成功: %s", bot.user)
+        logging.info("スラッシュコマンド同期: %d個", len(synced))
+    except Exception:
+        logging.exception("スラッシュコマンドの同期に失敗しました")
+
+
+# =========================
+# /ping
+# =========================
+@bot.tree.command(name="ping", description="Botが動いているか確認します")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong!")
+
+
+# =========================
+# /menu
+# =========================
+@bot.tree.command(name="menu", description="キラの自動販売機の商品一覧")
+async def menu(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🥤 キラの自動販売機",
+        description="販売商品一覧",
+    )
+
+    for product in PRODUCTS.values():
+        embed.add_field(
+            name=product["name"],
+            value=f'{product["price"]}円',
+            inline=False,
+        )
+
+    embed.set_footer(text="購入する場合は /buy を使用してください")
+
+    await interaction.response.send_message(embed=embed)
+
+
+# =========================
+# 商品選択
+# =========================
+class ProductSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=product["name"],
+                description=f'{product["price"]}円',
+                value=key,
+            )
+            for key, product in PRODUCTS.items()
+        ]
+
+        super().__init__(
+            placeholder="購入する商品を選択してください",
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        product_key = self.values[0]
+        product = PRODUCTS[product_key]
+
+        await interaction.response.defer(ephemeral=True)
+
+        api_key = os.getenv("PAYPAY_API_KEY")
+        api_secret = os.getenv("PAYPAY_API_SECRET")
+
+        if not api_key or not api_secret:
+            await interaction.followup.send(
+                "⚠️ PayPayの認証情報がまだ設定されていません。\n"
+                "管理者がReplit/GitHubのSecretsに設定する必要があります。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            # PayPay公式SDK
+            client = Client(
+                auth=(api_key, api_secret),
+                production_mode=False,
+            )
+
+            merchant_payment_id = (
+                f"discord-{interaction.user.id}-{uuid.uuid4().hex[:16]}"
+            )
+
+            request = {
+                "merchantPaymentId": merchant_payment_id,
+                "amount": {
+                    "amount": product["price"],
+                    "currency": "JPY",
+                },
+                "codeType": "ORDER_QR",
+                "orderDescription": f"キラの自動販売機 - {product['name']}",
+                "isAuthorization": False,
+            }
+
+            response = client.Code.create_qr_code(request)
+
+            # SDKのレスポンスを確認
+            if not response:
+                raise RuntimeError("PayPay APIから空のレスポンスが返りました")
+
+            data = response.get("data", {})
+            payment_url = data.get("url")
+
+            if not payment_url:
+                result_info = response.get("resultInfo", {})
+                message = result_info.get("message", "URLを取得できませんでした")
+                raise RuntimeError(message)
+
+            await interaction.followup.send(
+                f"💳 **{product['name']} {product['price']}円**\n\n"
+                f"下のURLからPayPayで支払ってください。\n"
+                f"{payment_url}\n\n"
+                "⚠️ 支払い完了を確認するまで購入完了にはなりません。",
+                ephemeral=True,
+            )
+
+        except Exception:
+            logging.exception("PayPay決済URLの作成に失敗しました")
+
+            await interaction.followup.send(
+                "❌ PayPayの支払いURLを作成できませんでした。\n"
+                "PayPayの認証情報や加盟店設定を確認してください。",
+                ephemeral=True,
+            )
+
+
+class BuyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(ProductSelect())
+
+
+# =========================
+# /buy
+# =========================
+@bot.tree.command(name="buy", description="商品を購入します")
+async def buy(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "🥤 **キラの自動販売機**\n\n"
+        "購入する商品を選択してください。",
+        view=BuyView(),
+        ephemeral=True,
+    )
+
+
+# =========================
+# 起動
+# =========================
+token = os.getenv("DISCORD_TOKEN")
+
+if not token:
+    raise RuntimeError("DISCORD_TOKEN が設定されていません")
+
+bot.run(token)
