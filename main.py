@@ -1,7 +1,6 @@
 import os
 import json
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 PRODUCT_FILE = "products.json"
@@ -40,34 +39,24 @@ bot = commands.Bot(
 )
 
 
-def vending_text():
-    text = "🥤 **キラの自動販売機**\n\n"
-
-    if not PRODUCTS:
-        text += "現在、商品がありません。"
-        return text
-
-    for name, price in PRODUCTS.items():
-        text += f"・**{name}**　{price}円\n"
-
-    text += "\n👇 購入したい商品のボタンを押してください！"
-    return text
-
+# =========================
+# 購入画面
+# =========================
 
 class PurchaseModal(discord.ui.Modal):
-
     def __init__(self, product_name):
         super().__init__(title=f"{product_name}を購入")
+
         self.product_name = product_name
 
-        self.url = discord.ui.TextInput(
+        self.url_input = discord.ui.TextInput(
             label="PayPay送金URL",
             placeholder="PayPayの送金URLを入力してください",
             required=True,
             max_length=500
         )
 
-        self.add_item(self.url)
+        self.add_item(self.url_input)
 
     async def on_submit(self, interaction: discord.Interaction):
 
@@ -80,31 +69,32 @@ class PurchaseModal(discord.ui.Modal):
             )
             return
 
+        paypay_url = self.url_input.value.strip()
+
         await interaction.response.send_message(
             f"✅ 注文を受け付けました！\n\n"
             f"商品：**{self.product_name}**\n"
-            f"価格：**{price}円**\n"
-            f"PayPay送金URL：\n{self.url.value}",
+            f"価格：**{price}円**\n\n"
+            f"PayPay送金URL：\n{paypay_url}",
             ephemeral=True
         )
 
         print(
-            f"注文: {interaction.user} / "
-            f"{self.product_name} / "
-            f"{price}円 / "
-            f"{self.url.value}"
+            f"注文者: {interaction.user} | "
+            f"商品: {self.product_name} | "
+            f"価格: {price}円 | "
+            f"URL: {paypay_url}"
         )
 
 
 class PurchaseButton(discord.ui.Button):
-
     def __init__(self, product_name, price):
         super().__init__(
             label=f"{product_name}を購入",
             style=discord.ButtonStyle.green
         )
+
         self.product_name = product_name
-        self.price = price
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
@@ -113,16 +103,20 @@ class PurchaseButton(discord.ui.Button):
 
 
 class VendingView(discord.ui.View):
-
     def __init__(self):
         super().__init__(timeout=None)
 
         for name, price in PRODUCTS.items():
-            self.add_item(PurchaseButton(name, price))
+            self.add_item(
+                PurchaseButton(name, price)
+            )
 
+
+# =========================
+# 管理者：商品追加
+# =========================
 
 class AddProductModal(discord.ui.Modal):
-
     def __init__(self):
         super().__init__(title="商品を追加")
 
@@ -174,15 +168,20 @@ class AddProductModal(discord.ui.Modal):
         save_products(PRODUCTS)
 
         await interaction.response.send_message(
-            f"✅ 商品を追加しました！\n"
-            f"**{name}：{price}円**",
+            f"✅ 商品を追加しました！\n\n"
+            f"商品：**{name}**\n"
+            f"価格：**{price}円**",
             ephemeral=True
         )
 
 
-class DeleteProductSelect(discord.ui.Select):
+# =========================
+# 管理者：商品削除
+# =========================
 
+class DeleteProductSelect(discord.ui.Select):
     def __init__(self):
+
         options = [
             discord.SelectOption(
                 label=name,
@@ -219,13 +218,16 @@ class DeleteProductSelect(discord.ui.Select):
 
 
 class DeleteProductView(discord.ui.View):
-
     def __init__(self):
         super().__init__(timeout=120)
 
         if PRODUCTS:
             self.add_item(DeleteProductSelect())
 
+
+# =========================
+# 管理者画面
+# =========================
 
 class AdminView(discord.ui.View):
 
@@ -281,6 +283,10 @@ class AdminView(discord.ui.View):
         )
 
 
+# =========================
+# Bot起動
+# =========================
+
 @bot.event
 async def on_ready():
 
@@ -293,13 +299,24 @@ async def on_ready():
         print(f"コマンド同期エラー: {e}")
 
 
+# =========================
+# /ping
+# =========================
+
 @bot.tree.command(
     name="ping",
     description="Botが動いているか確認します"
 )
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
 
+    await interaction.response.send_message(
+        "Pong!"
+    )
+
+
+# =========================
+# /menu
+# =========================
 
 @bot.tree.command(
     name="menu",
@@ -307,11 +324,25 @@ async def ping(interaction: discord.Interaction):
 )
 async def menu(interaction: discord.Interaction):
 
+    text = "🥤 **キラの自動販売機**\n\n"
+
+    if PRODUCTS:
+        for name, price in PRODUCTS.items():
+            text += f"・**{name}**　{price}円\n"
+    else:
+        text += "現在、商品がありません。\n"
+
+    text += "\n👇 購入したい商品のボタンを押してください！"
+
     await interaction.response.send_message(
-        vending_text(),
+        text,
         view=VendingView()
     )
 
+
+# =========================
+# /admin
+# =========================
 
 @bot.tree.command(
     name="admin",
@@ -328,11 +359,15 @@ async def admin(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "👑 **キラの自動販売機 管理画面**\n\n"
-        "ボタンから商品の追加・削除ができます。",
+        "商品の追加・削除ができます。",
         view=AdminView(),
         ephemeral=True
     )
 
+
+# =========================
+# Token
+# =========================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
