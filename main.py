@@ -407,6 +407,8 @@ async def create_ticket(order, guild, buyer):
 # ============================================================
 
 class PurchaseView(discord.ui.View):
+    # 購入パネルはこの永続Viewを直接登録してボタンを処理する。
+    # DynamicItemとの二重登録を避け、購入ボタンのACK経路を一本化する。
     def __init__(self):
         super().__init__(timeout=None)
         active = [p for p in products.values() if p.get("active", True)]
@@ -416,15 +418,28 @@ class PurchaseView(discord.ui.View):
 
 class ProductPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:buy:(?P<pid>[A-Za-z0-9_-]{1,64})"):
     async def callback(self, interaction: discord.Interaction):
-        product_id = self.item.custom_id.split(":", 2)[-1]
-        product = find_product(product_id)
-        if not product or not product.get("active", True):
-            await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
-            return
-        if int(product.get("stock", 0)) <= 0:
-            await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
-            return
-        await interaction.response.send_message(embed=product_embed(product), view=ProductDetailView(product_id), ephemeral=True)
+        # 念のため残してある互換用ハンドラ。現在の購入パネルはPurchaseViewで処理する。
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        try:
+            product_id = self.item.custom_id.split(":", 2)[-1]
+            product = find_product(product_id)
+            if not product or not product.get("active", True):
+                await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
+                return
+            if int(product.get("stock", 0)) <= 0:
+                await interaction.followup.send("❌ この商品は売り切れです。", ephemeral=True)
+                return
+            await interaction.followup.send(
+                embed=product_embed(product),
+                view=ProductDetailView(product_id),
+                ephemeral=True,
+            )
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ 商品画面の表示中にエラーが発生しました。管理者に確認してください。",
+                ephemeral=True,
+            )
 
 
 class OrderPaidPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:paid:(?P<oid>[A-Za-z0-9_-]{1,64})"):
@@ -483,18 +498,28 @@ class ProductButton(discord.ui.Button):
         self.product_id = product_id
 
     async def callback(self, interaction: discord.Interaction):
-        product = find_product(self.product_id)
-        if not product or not product.get("active", True):
-            await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
-            return
-        if int(product.get("stock", 0)) <= 0:
-            await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            embed=product_embed(product),
-            view=ProductDetailView(self.product_id),
-            ephemeral=True,
-        )
+        # ボタン押下から3秒以内に必ずACKしてから処理する。
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        try:
+            product = find_product(self.product_id)
+            if not product or not product.get("active", True):
+                await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
+                return
+            if int(product.get("stock", 0)) <= 0:
+                await interaction.followup.send("❌ この商品は売り切れです。", ephemeral=True)
+                return
+
+            await interaction.followup.send(
+                embed=product_embed(product),
+                view=ProductDetailView(self.product_id),
+                ephemeral=True,
+            )
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ 商品画面の表示中にエラーが発生しました。管理者に確認してください。",
+                ephemeral=True,
+            )
 
 
 class ProductDetailView(discord.ui.View):
@@ -607,6 +632,71 @@ class PayPayModal(discord.ui.Modal, title="PayPayで購入"):
                 "❌ 購入処理中にエラーが発生しました。管理者に確認してください。",
                 ephemeral=True,
             )
+
+
+class ProcessedOrderView(discord.ui.View):
+    """処理済み注文に表示する、操作不能の状態表示。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(
+            label="処理済み",
+            emoji="🔒",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+        self.add_item(button)
+
+
+async def process_paid_order(interaction: discord.Interaction, order_id):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+
+    order = orders.get(order_id)
+    if not order:
+        await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
+        return
+
+    if order.get("status") == "paid":
+        await interaction.response.send_message("❌ すでに支払い確認済みです。", ephemeral=True)
+        return
+
+    if order.get("status") == "cancelled":
+        await interaction.response.send_message("❌ キャンセル済みの注文は支払い確認できません。", ephemeral=True)
+        return
+
+    # 注文状態の更新やチャンネル処理の前にACKする。
+    await interaction.response.defer()
+
+    order["status"] = "paid"
+    order["paid_at"] = now_iso()
+    save_json(ORDERS_FILE, orders)
+
+    try:
+        await interaction.edit_original_response(
+            embed=order_embed(order),
+            view=ProcessedOrderView(),
+        )
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+    try:
+        buyer = (
+            interaction.guild.get_member(int(order.get("buyer_id", 0)))
+            or await interaction.guild.fetch_member(int(order.get("buyer_id", 0)))
+        )
+        await buyer.send(f"🟢 注文 **{order_id}** の支払い確認が完了しました。")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+        pass
+
+    ticket_id = order.get("ticket_channel_id")
+    if ticket_id:
+        try:
+            ticket = interaction.guild.get_channel(int(ticket_id))
+            if ticket:
+                await ticket.send("🟢 **支払い確認済み**になりました。")
+        except (discord.HTTPException, ValueError):
+            pass
 
 
 class OrderPaidButton(discord.ui.Button):
@@ -1311,7 +1401,6 @@ class KiraBot(commands.Bot):
         self.add_view(PurchaseView())
         self.add_view(AdminPanelView())
         self.add_dynamic_items(
-            ProductPersistentButton,
             OrderPaidPersistentButton,
             OrderCancelPersistentButton,
             TicketArchivePersistentButton,
