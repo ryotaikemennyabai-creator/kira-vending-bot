@@ -1436,20 +1436,6 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @product_image.autocomplete("product")
-    async def product_image_autocomplete(self, interaction: discord.Interaction, current: str):
-        if not is_admin(interaction.user):
-            return []
-        current = current.lower().strip()
-        results = []
-        for pid, p in products.items():
-            name = str(p.get("name", pid))
-            if current in pid.lower() or current in name.lower():
-                results.append(app_commands.Choice(name=f"{name} [{pid}]"[:100], value=pid))
-            if len(results) >= 25:
-                break
-        return results
-
     @app_commands.command(name="product_image", description="管理者専用：PCから商品画像を直接アップロードして設定")
     @app_commands.describe(product="商品ID", image="設定する画像ファイル")
     async def product_image(self, interaction: discord.Interaction, product: str, image: discord.Attachment):
@@ -1467,6 +1453,20 @@ class AdminCog(commands.Cog):
         save_json(PRODUCTS_FILE, products)
         await update_purchase_panel()
         await interaction.response.send_message(f"🖼️ **{target.get('name', product)}** の画像を設定しました。", ephemeral=True)
+
+    @product_image.autocomplete("product")
+    async def product_image_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not is_admin(interaction.user):
+            return []
+        current = current.lower().strip()
+        results = []
+        for pid, p in products.items():
+            name = str(p.get("name", pid))
+            if current in pid.lower() or current in name.lower():
+                results.append(app_commands.Choice(name=f"{name} [{pid}]"[:100], value=pid))
+            if len(results) >= 25:
+                break
+        return results
 
 
 @bot.event
