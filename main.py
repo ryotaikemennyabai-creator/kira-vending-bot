@@ -1110,7 +1110,7 @@ class ProductAdminView(discord.ui.View):
 # デザイン管理
 # ============================================================
 
-class DesignTextModal(discord.ui.Modal, title="販売機の文章を編集"):
+class DesignTextModal(discord.ui.Modal, title="タイトル・説明を編集"):
     title_text = discord.ui.TextInput(label="タイトル", max_length=256)
     subtitle = discord.ui.TextInput(label="サブタイトル", max_length=256, required=False)
     description = discord.ui.TextInput(label="説明文", style=discord.TextStyle.paragraph, max_length=2000, required=False)
@@ -1186,15 +1186,20 @@ class DesignPresetView(discord.ui.View):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        config["design"]["color"] = color
-        config["design"]["title"] = title
-        save_json(CONFIG_FILE, config)
-        await update_purchase_panel()
-        await interaction.response.send_message("✅ プリセットを適用しました。", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            config["design"]["color"] = color
+            config["design"]["title"] = title
+            save_json(CONFIG_FILE, config)
+            await update_purchase_panel()
+            await interaction.followup.send("✅ プリセットを適用しました。", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ デザインの更新中にエラーが発生しました。管理者に確認してください。", ephemeral=True)
 
 
 class DesignView(discord.ui.View):
-    @discord.ui.button(label="文章", emoji="📝", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="タイトル・説明", emoji="📝", style=discord.ButtonStyle.primary, row=0)
     async def text(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
@@ -1272,24 +1277,39 @@ class ChannelSettingsView(discord.ui.View):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        channel = await find_purchase_channel(interaction.guild, create=True)
-        await interaction.response.send_message(f"✅ 購入チャンネル: {channel.mention}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await find_purchase_channel(interaction.guild, create=True)
+            await interaction.followup.send(f"✅ 購入チャンネル: {channel.mention}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ 購入チャンネルの作成中にエラーが発生しました。", ephemeral=True)
 
     @discord.ui.button(label="注文通知を自動作成", emoji="🧾", style=discord.ButtonStyle.success)
     async def create_order(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        channel = await get_or_create_order_channel(interaction.guild)
-        await interaction.response.send_message(f"✅ 注文通知: {channel.mention}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await get_or_create_order_channel(interaction.guild)
+            await interaction.followup.send(f"✅ 注文通知: {channel.mention}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ 注文通知チャンネルの作成中にエラーが発生しました。", ephemeral=True)
 
     @discord.ui.button(label="メディアを自動作成", emoji="🖼️", style=discord.ButtonStyle.success)
     async def create_media(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        channel = await get_or_create_media_channel(interaction.guild)
-        await interaction.response.send_message(f"✅ メディア: {channel.mention}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await get_or_create_media_channel(interaction.guild)
+            await interaction.followup.send(f"✅ メディア: {channel.mention}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ メディアチャンネルの作成中にエラーが発生しました。", ephemeral=True)
 
 
 # ============================================================
@@ -1317,8 +1337,13 @@ class MediaView(discord.ui.View):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        channel = await get_or_create_media_channel(interaction.guild)
-        await interaction.response.send_message(f"🖼️ {channel.mention}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = await get_or_create_media_channel(interaction.guild)
+            await interaction.followup.send(f"🖼️ {channel.mention}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ メディアチャンネルの処理中にエラーが発生しました。", ephemeral=True)
 
     @discord.ui.button(label="保存メディア一覧", emoji="📚", style=discord.ButtonStyle.secondary)
     async def saved_media(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1421,16 +1446,21 @@ class AdminMessageModal(discord.ui.Modal, title="管理者メッセージ送信"
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        channel = interaction.channel
-        content = str(self.content.value).strip()
-        title = str(self.title_text.value).strip()
-        if title:
-            embed = discord.Embed(title=title, description=content, color=design_color())
-            embed.set_footer(text=config["design"].get("footer", BOT_NAME))
-            await channel.send(embed=embed)
-        else:
-            await channel.send(content)
-        await interaction.response.send_message("✅ ボットとしてメッセージを送信しました。", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            channel = interaction.channel
+            content = str(self.content.value).strip()
+            title = str(self.title_text.value).strip()
+            if title:
+                embed = discord.Embed(title=title, description=content, color=design_color())
+                embed.set_footer(text=config["design"].get("footer", BOT_NAME))
+                await channel.send(embed=embed)
+            else:
+                await channel.send(content)
+            await interaction.followup.send("✅ ボットとしてメッセージを送信しました。", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ メッセージ送信中にエラーが発生しました。", ephemeral=True)
 
 
 # ============================================================
@@ -1446,8 +1476,13 @@ class AdminPanelView(discord.ui.View):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        message = await deploy_purchase_panel(interaction.guild)
-        await interaction.response.send_message(f"✅ 販売機を更新しました。\n{message.jump_url}", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            message = await deploy_purchase_panel(interaction.guild)
+            await interaction.followup.send(f"✅ 販売機を更新しました。\n{message.jump_url}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ 販売機の設置・更新中にエラーが発生しました。管理者に確認してください。", ephemeral=True)
 
     @discord.ui.button(label="商品管理", emoji="🛍️", style=discord.ButtonStyle.primary, custom_id="kira:admin:products", row=0)
     async def products(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1552,8 +1587,13 @@ class AdminCog(commands.Cog):
         if not is_admin(interaction.user):
             await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-        await interaction.channel.send(message)
-        await interaction.response.send_message("✅ 送信しました。", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await interaction.channel.send(message)
+            await interaction.followup.send("✅ 送信しました。", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ メッセージ送信中にエラーが発生しました。", ephemeral=True)
 
     @app_commands.command(name="product_add", description="管理者専用：商品を追加")
     @app_commands.describe(
