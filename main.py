@@ -2,11 +2,23 @@ import os
 import json
 import asyncio
 import re
+import traceback
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# ============================================================
+# キラの自動販売機 - 完成版
+# 変更方針:
+# ・既存の自動販売機機能を維持
+# ・管理者専用のメッセージ送信機能を追加
+# ・商品画像をPCから直接アップロードできる管理者コマンドを追加
+# ・購入者側の表示を整理・洗練
+# ・注文処理ボタン後の未定義ビュー問題を修正
+# ============================================================
 
 BOT_NAME = "キラの自動販売機"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,37 +30,36 @@ DEFAULT_CONFIG = {
     "guild_id": 0,
     "purchase_channel_id": 0,
     "order_channel_id": 0,
-    "admin_category_id": 0,
-    "ticket_category_id": 0,
     "media_channel_id": 0,
+    "archive_category_id": 0,
     "panel_message_id": 0,
     "panel_channel_id": 0,
-    "order_counter": 0,
+    "order_counter": 1000,
     "media_library": [],
     "design": {
         "title": "🛒 キラの自動販売機",
-        "subtitle": "✨ 商品を選択してお買い物をお楽しみください ✨",
-        "description": "下のボタンから商品を選択してください。",
-        "notice": "📢 ご購入前に商品内容をご確認ください。",
-        "footer": "KIRA VENDING",
-        "color": 0x8B5CF6,
+        "subtitle": "欲しい商品を選んで、かんたん購入",
+        "description": "下のボタンから商品を選択してください。\n在庫状況もリアルタイムで表示されます。",
+        "notice": "💡 購入後は専用チャットが自動作成されます。",
+        "footer": "KIRA VENDING • SAFE & SIMPLE",
+        "color": 0x5865F2,
         "banner_url": "",
         "show_stock": True,
     },
 }
 
-DEFAULT_PRODUCTS = [
-    {
-        "id": "sample-1",
+DEFAULT_PRODUCTS = {
+    "sample": {
+        "id": "sample",
         "name": "サンプル商品",
-        "description": "管理画面から商品情報を変更できます。",
-        "price": 500,
+        "description": "商品説明を入力してください。",
+        "price": 100,
         "stock": 10,
-        "emoji": "🛍️",
+        "active": True,
         "image_url": "",
-        "enabled": True,
+        "emoji": "🛍️",
     }
-]
+}
 
 
 def save_json(path, data):
@@ -59,13 +70,11 @@ def save_json(path, data):
 
 
 def load_json(path, default):
-    if not os.path.exists(path):
-        save_json(path, default)
-        return json.loads(json.dumps(default, ensure_ascii=False))
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         save_json(path, default)
         return json.loads(json.dumps(default, ensure_ascii=False))
 
@@ -74,30 +83,27 @@ config = load_json(CONFIG_FILE, DEFAULT_CONFIG)
 products = load_json(PRODUCTS_FILE, DEFAULT_PRODUCTS)
 orders = load_json(ORDERS_FILE, {})
 
-if not isinstance(products, list):
-    products = DEFAULT_PRODUCTS.copy()
+# 既存ファイルが古くても不足キーを補完
+for key, value in DEFAULT_CONFIG.items():
+    if key not in config:
+        config[key] = json.loads(json.dumps(value, ensure_ascii=False))
+
+if not isinstance(config.get("design"), dict):
+    config["design"] = json.loads(json.dumps(DEFAULT_CONFIG["design"], ensure_ascii=False))
+else:
+    for key, value in DEFAULT_CONFIG["design"].items():
+        config["design"].setdefault(key, value)
+
+if not isinstance(config.get("media_library"), list):
+    config["media_library"] = []
+
+if not isinstance(products, dict):
+    products = {}
 if not isinstance(orders, dict):
     orders = {}
 
-for key, value in DEFAULT_CONFIG.items():
-    if key not in config:
-        config[key] = json.loads(json.dumps(value)) if isinstance(value, dict) else value
-for key, value in DEFAULT_CONFIG["design"].items():
-    config.setdefault("design", {}).setdefault(key, value)
-config.setdefault("media_library", [])
-
-for p in products:
-    p.setdefault("id", f"product-{len(products) + 1}")
-    p.setdefault("name", "商品")
-    p.setdefault("description", "")
-    p.setdefault("price", 0)
-    p.setdefault("stock", 0)
-    p.setdefault("emoji", "🛒")
-    p.setdefault("image_url", "")
-    p.setdefault("enabled", True)
-
-save_json(PRODUCTS_FILE, products)
 save_json(CONFIG_FILE, config)
+save_json(PRODUCTS_FILE, products)
 save_json(ORDERS_FILE, orders)
 
 purchase_lock = asyncio.Lock()
@@ -108,35 +114,86 @@ def now_iso():
 
 
 def money(value):
-    return f"¥{int(value):,}"
+    try:
+        return f"¥{int(value):,}"
+    except (TypeError, ValueError):
+        return "¥0"
 
 
 def is_admin(member):
-    return isinstance(member, discord.Member) and member.guild_permissions.administrator
+    return bool(member and getattr(member, "guild_permissions", None) and member.guild_permissions.administrator)
 
 
 def find_product(product_id):
-    for p in products:
-        if p.get("id") == product_id:
-            return p
-    return None
+    return products.get(str(product_id))
 
 
 def next_order_id():
-    config["order_counter"] = int(config.get("order_counter", 0)) + 1
+    try:
+        number = int(config.get("order_counter", 1000))
+    except (TypeError, ValueError):
+        number = 1000
+    config["order_counter"] = number + 1
     save_json(CONFIG_FILE, config)
-    return f"{config['order_counter']:05d}"
+    return f"KIRA-{number:06d}"
 
 
-def channel_mention(guild, cid):
-    ch = guild.get_channel(int(cid or 0)) if guild else None
-    return ch.mention if ch else "未設定"
+def channel_mention(channel_id):
+    try:
+        channel_id = int(channel_id)
+        return f" <#{channel_id}>" if channel_id else " 未設定"
+    except (TypeError, ValueError):
+        return " 未設定"
 
 
-def category_mention(guild, cid):
-    ch = guild.get_channel(int(cid or 0)) if guild else None
-    return f"`{ch.name}`" if isinstance(ch, discord.CategoryChannel) else "未設定"
+def category_mention(category_id):
+    try:
+        category_id = int(category_id)
+        return f" <#{category_id}>" if category_id else " 未設定"
+    except (TypeError, ValueError):
+        return " 未設定"
 
+
+def safe_id(text, fallback="product"):
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", str(text)).strip("-")
+    value = value[:50]
+    if not value:
+        value = fallback
+    return value
+
+
+def unique_product_id(base):
+    base = safe_id(base, "product")
+    candidate = base
+    number = 2
+    while candidate in products:
+        candidate = f"{base}-{number}"
+        number += 1
+    return candidate
+
+
+def normalize_product(product_id, data):
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("id", product_id)
+    data.setdefault("name", "商品")
+    data.setdefault("description", "")
+    data.setdefault("price", 0)
+    data.setdefault("stock", 0)
+    data.setdefault("active", True)
+    data.setdefault("image_url", "")
+    data.setdefault("emoji", "🛍️")
+    return data
+
+
+for pid in list(products.keys()):
+    products[pid] = normalize_product(pid, products[pid])
+save_json(PRODUCTS_FILE, products)
+
+
+# ============================================================
+# Discord
+# ============================================================
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -146,397 +203,295 @@ intents.message_content = True
 
 
 # ============================================================
-# デザイン
+# 見た目
 # ============================================================
+
+
+def design_color():
+    try:
+        return discord.Color(int(config["design"].get("color", 0x5865F2)))
+    except (TypeError, ValueError):
+        return discord.Color.blurple()
+
+
+def stock_text(product):
+    stock = int(product.get("stock", 0))
+    if stock <= 0:
+        return "🔴 売り切れ"
+    if stock <= 3:
+        return f"🟠 残り {stock}個"
+    return f"🟢 在庫 {stock}個"
+
+
+def product_line(product):
+    emoji = product.get("emoji") or "🛍️"
+    name = str(product.get("name", "商品"))
+    price = money(product.get("price", 0))
+    if config["design"].get("show_stock", True):
+        return f"{emoji} **{name}**　`{price}`　{stock_text(product)}"
+    return f"{emoji} **{name}**　`{price}`"
 
 
 def design_embed():
     d = config["design"]
     embed = discord.Embed(
-        title=d["title"],
+        title=d.get("title", BOT_NAME),
         description=(
-            f"**{d['subtitle']}**\n\n"
-            f"{d['description']}\n\n"
-            f"{d['notice']}"
+            f"**{d.get('subtitle', '')}**\n\n"
+            f"{d.get('description', '')}"
         ),
-        color=int(d["color"]),
+        color=design_color(),
+        timestamp=datetime.now(timezone.utc),
     )
 
-    active = [p for p in products if p.get("enabled", True)]
-    if not active:
+    active = [normalize_product(pid, p) for pid, p in products.items() if p.get("active", True)]
+    active = active[:25]
+    if active:
         embed.add_field(
-            name="📦 商品",
-            value="現在販売中の商品はありません。",
+            name="🛍️ 商品ラインナップ",
+            value="\n".join(product_line(p) for p in active),
             inline=False,
         )
     else:
-        chunks = []
-        for p in active[:25]:
-            stock = int(p.get("stock", 0))
-            stock_text = f"在庫: **{stock}**" if d.get("show_stock", True) else "在庫あり"
-            if stock <= 0:
-                stock_text = "🔴 売り切れ"
-            chunks.append(
-                f"{p.get('emoji', '🛒')} **{p['name']}** — {money(p['price'])}\n"
-                f"{p.get('description', '')[:120]}\n{stock_text}"
-            )
         embed.add_field(
-            name="🛍️ 商品一覧",
-            value="\n\n".join(chunks)[:1024],
+            name="🛍️ 商品ラインナップ",
+            value="現在販売中の商品はありません。",
             inline=False,
         )
 
-    if d.get("footer"):
-        embed.set_footer(text=d["footer"])
+    notice = d.get("notice", "")
+    if notice:
+        embed.add_field(name="📌 ご案内", value=notice, inline=False)
+
+    footer = d.get("footer", "")
+    if footer:
+        embed.set_footer(text=footer)
+
+    banner = d.get("banner_url", "")
+    if banner:
+        embed.set_image(url=banner)
+
+    return embed
+
+
+def product_embed(product):
+    embed = discord.Embed(
+        title=f"{product.get('emoji', '🛍️')} {product.get('name', '商品')}",
+        description=product.get("description", "説明はありません。"),
+        color=design_color(),
+    )
+    embed.add_field(name="💰 価格", value=f"**{money(product.get('price', 0))}**", inline=True)
+    embed.add_field(name="📦 在庫", value=stock_text(product), inline=True)
+    if product.get("image_url"):
+        embed.set_thumbnail(url=product["image_url"])
+    embed.set_footer(text="購入内容をご確認のうえ「購入する」を押してください。")
+    return embed
+
+
+def order_embed(order):
+    product = find_product(order.get("product_id", "")) or {}
+    status_map = {
+        "pending": "🟡 支払い確認待ち",
+        "paid": "🟢 支払い確認済み",
+        "cancelled": "🔴 キャンセル",
+    }
+    status = status_map.get(order.get("status"), order.get("status", "不明"))
+    embed = discord.Embed(title=f"🧾 注文 {order.get('id', '-')}", color=design_color())
+    embed.add_field(name="商品", value=f"{product.get('emoji', '🛍️')} {product.get('name', order.get('product_id', '-'))}", inline=False)
+    embed.add_field(name="金額", value=money(order.get("price", product.get("price", 0))), inline=True)
+    embed.add_field(name="購入者", value=f"<@{order.get('buyer_id')}>" if order.get("buyer_id") else "不明", inline=True)
+    embed.add_field(name="状態", value=status, inline=True)
+    embed.add_field(name="PayPay URL", value=order.get("paypay_url", "未入力"), inline=False)
+    embed.add_field(name="注文日時", value=order.get("created_at", "-"), inline=False)
     return embed
 
 
 # ============================================================
-# 非公開チャンネル権限
+# チャンネル権限
 # ============================================================
 
 async def secure_private_channel(channel, guild, buyer=None):
-    """一般ユーザーから隠し、Botと購入者だけが使えるようにする。"""
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+
     me = guild.me
-    if me is None:
-        raise RuntimeError("BotのMember情報を取得できません。")
-
-    if not me.guild_permissions.manage_channels:
-        raise RuntimeError("Botに「チャンネルの管理」権限がありません。")
-
-    # @everyoneを非表示にする。AdministratorはDiscord側でこの拒否を迂回する。
-    await channel.set_permissions(
-        guild.default_role,
-        view_channel=False,
-        reason=f"{BOT_NAME} 非公開設定",
-    )
-
-    # Administratorなら余計なBot用overwrite APIを呼ばない。
-    if not me.guild_permissions.administrator:
-        await channel.set_permissions(
-            me,
+    if me and not me.guild_permissions.administrator:
+        overwrites[me] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
             read_message_history=True,
-            embed_links=True,
-            attach_files=True,
-            manage_messages=True,
             manage_channels=True,
-            reason=f"{BOT_NAME} Bot権限",
         )
 
-    if buyer is not None:
-        await channel.set_permissions(
-            buyer,
+    if buyer:
+        overwrites[buyer] = discord.PermissionOverwrite(
             view_channel=True,
             send_messages=True,
             read_message_history=True,
-            embed_links=True,
             attach_files=True,
-            reason=f"{BOT_NAME} 購入者権限",
+            embed_links=True,
         )
 
-    perms = channel.permissions_for(me)
-    if not perms.view_channel or not perms.send_messages:
-        raise RuntimeError(
-            "作成した非公開チャンネルでBotが閲覧/送信できません。"
-            f" (view={perms.view_channel}, send={perms.send_messages})"
-        )
+    try:
+        await channel.edit(overwrites=overwrites)
+    except discord.Forbidden:
+        pass
 
 
 async def get_or_create_category(guild, name, config_key):
-    cid = int(config.get(config_key, 0) or 0)
-    if cid:
-        category = guild.get_channel(cid)
+    category_id = config.get(config_key, 0)
+    if category_id:
+        category = guild.get_channel(int(category_id))
         if isinstance(category, discord.CategoryChannel):
             return category
 
-    me = guild.me
-    if not me or not me.guild_permissions.manage_channels:
-        raise RuntimeError("Botに「チャンネルの管理」権限がありません。")
+    category = discord.utils.get(guild.categories, name=name)
+    if category is None:
+        category = await guild.create_category(name=name, reason=f"{BOT_NAME} 自動作成")
 
-    category = await guild.create_category(
-        name,
-        reason=f"{BOT_NAME} 自動作成",
-    )
     config[config_key] = category.id
     save_json(CONFIG_FILE, config)
     return category
 
 
-# ============================================================
-# 注文通知
-# ============================================================
+async def get_or_create_order_channel(guild):
+    channel_id = config.get("order_channel_id", 0)
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
 
-async def get_or_create_order_channel(guild: discord.Guild):
-    """管理者専用 #注文通知 を取得し、なければBot自身で作成する。"""
-    if guild is None:
-        raise RuntimeError("サーバー情報を取得できません。")
+    channel = discord.utils.get(guild.text_channels, name="注文通知")
+    if channel is None:
+        channel = await guild.create_text_channel("注文通知", reason=f"{BOT_NAME} 注文通知チャンネル")
 
-    me = guild.me
-    if me is None:
-        raise RuntimeError("BotのMember情報を取得できません。")
-    if not me.guild_permissions.manage_channels:
-        raise RuntimeError("Botに「チャンネルの管理」権限がありません。")
-
-    saved_id = int(config.get("order_channel_id", 0) or 0)
-    channel = guild.get_channel(saved_id) if saved_id else None
-
-    if not isinstance(channel, discord.TextChannel):
-        channel = next((c for c in guild.text_channels if c.name == "注文通知"), None)
-
-    if isinstance(channel, discord.TextChannel):
-        try:
-            await secure_private_channel(channel, guild)
-        except discord.Forbidden as e:
-            raise RuntimeError(
-                "既存の #注文通知 の非公開設定に失敗しました。"
-                "Botの「チャンネルの管理」権限を確認してください。"
-            ) from e
-        config["order_channel_id"] = channel.id
-        save_json(CONFIG_FILE, config)
-        return channel
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-    }
-    if not me.guild_permissions.administrator:
-        overwrites[me] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            embed_links=True,
-            attach_files=True,
-            manage_messages=True,
-        )
-
-    try:
-        channel = await guild.create_text_channel(
-            "注文通知",
-            overwrites=overwrites,
-            topic=f"{BOT_NAME} 注文通知（管理者専用）",
-            reason=f"{BOT_NAME} 注文通知チャンネル自動作成",
-        )
-    except discord.Forbidden as e:
-        raise RuntimeError(
-            "#注文通知を作成できませんでした。"
-            "Botの「チャンネルの管理」権限とロール位置を確認してください。"
-        ) from e
-
-    # 作成直後にも必ず検証。
-    try:
-        await secure_private_channel(channel, guild)
-    except discord.Forbidden as e:
-        raise RuntimeError(
-            "#注文通知は作成できましたが、非公開設定に失敗しました。"
-            "Botの「チャンネルの管理」権限を確認してください。"
-        ) from e
-
+    await secure_private_channel(channel, guild)
     config["order_channel_id"] = channel.id
     save_json(CONFIG_FILE, config)
     return channel
 
 
 async def get_or_create_ticket_category(guild):
-    return await get_or_create_category(
-        guild,
-        "💬 購入チャット",
-        "ticket_category_id",
-    )
+    return await get_or_create_category(guild, "💬 購入チャット", "ticket_category_id")
 
 
-async def create_ticket(order, guild: discord.Guild, buyer: discord.Member):
-    """購入ごとに、購入者・Botだけが使える専用チャットを作る。管理者はAdministratorで閲覧可能。"""
-    me = guild.me
-    if me is None:
-        raise RuntimeError("BotのMember情報を取得できません。")
-    if not me.guild_permissions.manage_channels:
-        raise RuntimeError("Botに「チャンネルの管理」権限がありません。")
+async def get_or_create_archive_category(guild):
+    return await get_or_create_category(guild, "📁 購入履歴", "archive_category_id")
 
-    # カテゴリは見つかれば使う。カテゴリ作成/取得が失敗してもサーバー直下で続行。
-    category = None
-    try:
-        category = await get_or_create_ticket_category(guild)
-    except Exception as e:
-        print(f"[TICKET] カテゴリを使わず作成します: {e}")
 
-    channel_name = f"chat-kira-{clean_channel_name(str(order['id']))}"
-
-    # まずチャンネルだけ作る。複雑なoverwriteで作成時403になる可能性を下げる。
-    try:
+async def create_ticket(order, guild, buyer):
+    category = await get_or_create_ticket_category(guild)
+    channel_name = f"chat-kira-{order['id'].lower().replace('kira-', '')}"
+    channel = discord.utils.get(guild.text_channels, name=channel_name)
+    if channel is None:
         channel = await guild.create_text_channel(
             channel_name,
             category=category,
-            topic=f"キラ注文 #{order['id']} / {order['product_name']}",
-            reason=f"注文 #{order['id']} 専用チャット",
+            reason=f"{BOT_NAME} 注文チャット作成",
         )
-    except discord.Forbidden as first_error:
-        if category is None:
-            raise RuntimeError(
-                f"専用チャットの作成に失敗しました: {first_error}"
-            ) from first_error
-        print(f"[TICKET] カテゴリ付き作成失敗。直下で再試行: {first_error}")
-        try:
-            channel = await guild.create_text_channel(
-                channel_name,
-                topic=f"キラ注文 #{order['id']} / {order['product_name']}",
-                reason=f"注文 #{order['id']} 専用チャット再試行",
-            )
-        except discord.Forbidden as second_error:
-            raise RuntimeError(
-                f"専用チャットの作成に失敗しました: {second_error}"
-            ) from second_error
 
-    try:
-        await secure_private_channel(channel, guild, buyer)
-    except Exception:
-        # チャンネル自体は残す。注文データから管理者が確認できるようにする。
-        raise
-
-    embed = discord.Embed(
-        title=f"💬 注文 #{order['id']} 専用チャット",
-        description=(
-            f"**商品:** {order['product_name']}\n"
-            f"**金額:** {money(order['price'])}\n"
-            f"**購入者:** {buyer.mention}\n\n"
-            "PayPay送金URLを受け取りました。\n"
-            "管理者が入金確認後、注文処理を進めます。"
-        ),
-        color=discord.Color(config["design"].get("color", 0x8B5CF6)),
-    )
-    embed.add_field(
-        name="💳 PayPay送金URL",
-        value=order["paypay_url"][:1024],
-        inline=False,
-    )
-    embed.set_footer(text=f"{BOT_NAME} • #{order['id']}")
-
+    await secure_private_channel(channel, guild, buyer)
     await channel.send(
-        content=buyer.mention,
-        embed=embed,
-        view=TicketView(order["id"]),
-        allowed_mentions=discord.AllowedMentions(users=True),
+        content=f"{buyer.mention} ご購入ありがとうございます！",
+        embed=order_embed(order),
+        view=TicketView(order["id"], buyer.id),
     )
-
     order["ticket_channel_id"] = channel.id
     save_json(ORDERS_FILE, orders)
     return channel
 
 
 # ============================================================
-# 販売ボタン
+# 購入UI
 # ============================================================
-
-def make_purchase_view():
-    return PurchaseView()
-
 
 class PurchaseView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        active = [p for p in products if p.get("enabled", True)]
-        for p in active[:25]:
-            self.add_item(
-                ProductButton(
-                    p["id"],
-                    p.get("name", "商品"),
-                    p.get("emoji", "🛒"),
-                )
-            )
+        active = [p for p in products.values() if p.get("active", True)]
+        for product in active[:25]:
+            self.add_item(ProductButton(product["id"]))
+
+
+class ProductPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:buy:(?P<pid>[A-Za-z0-9_-]{1,64})"):
+    async def callback(self, interaction: discord.Interaction):
+        product_id = self.item.custom_id.split(":", 2)[-1]
+        product = find_product(product_id)
+        if not product or not product.get("active", True):
+            await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
+            return
+        if int(product.get("stock", 0)) <= 0:
+            await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=product_embed(product), view=ProductDetailView(product_id), ephemeral=True)
+
+
+class OrderPaidPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:paid:(?P<oid>[A-Za-z0-9_-]{1,64})"):
+    async def callback(self, interaction: discord.Interaction):
+        order_id = self.item.custom_id.split(":", 2)[-1]
+        await process_paid_order(interaction, order_id)
+
+
+class OrderCancelPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:cancel:(?P<oid>[A-Za-z0-9_-]{1,64})"):
+    async def callback(self, interaction: discord.Interaction):
+        order_id = self.item.custom_id.split(":", 2)[-1]
+        await process_cancel_order(interaction, order_id)
+
+
+class TicketArchivePersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:archive:(?P<oid>[A-Za-z0-9_-]{1,64})"):
+    async def callback(self, interaction: discord.Interaction):
+        order_id = self.item.custom_id.split(":", 2)[-1]
+        order = orders.get(order_id, {})
+        buyer_id = int(order.get("buyer_id", 0))
+        if not (is_admin(interaction.user) or interaction.user.id == buyer_id):
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+            return
+        category = await get_or_create_archive_category(interaction.guild)
+        await interaction.channel.edit(category=category, reason=f"{BOT_NAME} 購入履歴へ移動")
+        await interaction.response.send_message("📁 購入履歴へ移動しました。", ephemeral=True)
+
+
+class TicketDeletePersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:delete_ticket:(?P<oid>[A-Za-z0-9_-]{1,64})"):
+    async def callback(self, interaction: discord.Interaction):
+        order_id = self.item.custom_id.split(":", 2)[-1]
+        order = orders.get(order_id, {})
+        buyer_id = int(order.get("buyer_id", 0))
+        if not (is_admin(interaction.user) or interaction.user.id == buyer_id):
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+            return
+        await interaction.response.send_message("🗑️ チャットを削除します。", ephemeral=True)
+        await asyncio.sleep(1)
+        try:
+            await interaction.channel.delete(reason=f"{BOT_NAME} チケット削除")
+        except discord.HTTPException:
+            pass
 
 
 class ProductButton(discord.ui.Button):
-    def __init__(self, product_id, name, emoji):
-        product = find_product(product_id)
-        stock = int(product.get("stock", 0)) if product else 0
+    def __init__(self, product_id):
+        product = find_product(product_id) or {}
+        sold_out = int(product.get("stock", 0)) <= 0
         super().__init__(
-            label=(name[:77] + (" • SOLD OUT" if stock <= 0 else ""))[:80],
-            emoji=emoji[:10] if emoji else "🛒",
-            style=(
-                discord.ButtonStyle.secondary
-                if stock <= 0
-                else discord.ButtonStyle.primary
-            ),
-            disabled=stock <= 0,
+            label=(str(product.get("name", "商品"))[:80]),
+            emoji=product.get("emoji") or "🛍️",
+            style=discord.ButtonStyle.secondary if not sold_out else discord.ButtonStyle.danger,
             custom_id=f"kira:buy:{product_id}",
+            disabled=sold_out,
+            row=None,
         )
         self.product_id = product_id
 
     async def callback(self, interaction: discord.Interaction):
         product = find_product(self.product_id)
-        if not product or not product.get("enabled", True):
-            return await interaction.response.send_message(
-                "❌ この商品は現在販売されていません。",
-                ephemeral=True,
-            )
+        if not product or not product.get("active", True):
+            await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
+            return
         if int(product.get("stock", 0)) <= 0:
-            return await interaction.response.send_message(
-                "❌ この商品は売り切れです。",
-                ephemeral=True,
-            )
-
-        embed = discord.Embed(
-            title=f"{product.get('emoji', '🛒')} {product['name']}",
-            description=(
-                f"{product.get('description', '')}\n\n"
-                f"💰 **価格**　{money(product['price'])}\n"
-                f"📦 **在庫**　{product['stock']}"
-            ),
-            color=discord.Color(config["design"].get("color", 0x8B5CF6)),
-        )
-
-        image_url = product.get("image_url", "")
-        if image_url.startswith("http"):
-            embed.set_image(url=image_url)
-
+            await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
+            return
         await interaction.response.send_message(
-            embed=embed,
-            view=ProductDetailView(self.product_id),
-            ephemeral=True,
-        )
-
-
-class ProductPersistentButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"kira:buy:(?P<pid>[A-Za-z0-9_-]{1,64})",
-):
-    """古い販売パネルに残っている商品ボタンも再起動後に復元する。"""
-
-    def __init__(self, item, pid):
-        super().__init__(item)
-        self.product_id = pid
-
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match):
-        return cls(item, match["pid"])
-
-    async def callback(self, interaction: discord.Interaction):
-        product = find_product(self.product_id)
-        if not product or not product.get("enabled", True):
-            return await interaction.response.send_message(
-                "❌ この商品は現在販売されていません。",
-                ephemeral=True,
-            )
-        if int(product.get("stock", 0)) <= 0:
-            return await interaction.response.send_message(
-                "❌ この商品は売り切れです。",
-                ephemeral=True,
-            )
-
-        embed = discord.Embed(
-            title=f"{product.get('emoji', '🛒')} {product['name']}",
-            description=(
-                f"{product.get('description', '')}\n\n"
-                f"💰 **価格**　{money(product['price'])}\n"
-                f"📦 **在庫**　{product['stock']}"
-            ),
-            color=discord.Color(config["design"].get("color", 0x8B5CF6)),
-        )
-        if product.get("image_url", "").startswith("http"):
-            embed.set_image(url=product["image_url"])
-
-        await interaction.response.send_message(
-            embed=embed,
+            embed=product_embed(product),
             view=ProductDetailView(self.product_id),
             ephemeral=True,
         )
@@ -544,1438 +499,987 @@ class ProductPersistentButton(
 
 class ProductDetailView(discord.ui.View):
     def __init__(self, product_id):
-        super().__init__(timeout=120)
+        super().__init__(timeout=300)
         self.product_id = product_id
 
     @discord.ui.button(label="購入する", emoji="🛒", style=discord.ButtonStyle.success)
-    async def buy(self, interaction, button):
+    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
         product = find_product(self.product_id)
-        if not product or int(product.get("stock", 0)) <= 0:
-            return await interaction.response.send_message(
-                "❌ 売り切れです。",
-                ephemeral=True,
-            )
-        await interaction.response.send_modal(
-            PayPayModal(self.product_id)
-        )
+        if not product or not product.get("active", True):
+            await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
+            return
+        if int(product.get("stock", 0)) <= 0:
+            await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
+            return
+        await interaction.response.send_modal(PayPayModal(self.product_id))
 
-    @discord.ui.button(label="閉じる", emoji="✖️", style=discord.ButtonStyle.secondary)
-    async def close(self, interaction, button):
-        await interaction.response.edit_message(
-            content="閉じました。",
-            embed=None,
-            view=None,
-        )
+    @discord.ui.button(label="閉じる", emoji="✕", style=discord.ButtonStyle.secondary)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="この購入画面を閉じました。", embed=None, view=None)
 
 
-
-class PayPayModal(discord.ui.Modal, title="💳 PayPay送金URL"):
+class PayPayModal(discord.ui.Modal, title="PayPayで購入"):
     paypay_url = discord.ui.TextInput(
-        label="PayPay送金URL",
-        placeholder="https://pay.paypay.ne.jp/...",
+        label="PayPay送金リンク",
+        placeholder="https://...",
         required=True,
-        max_length=1000,
+        max_length=500,
     )
 
     def __init__(self, product_id):
         super().__init__()
         self.product_id = product_id
 
-    async def on_submit(self, interaction):
-        # Discordの3秒制限対策として、最初に応答を確定。
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        guild = interaction.guild
-        buyer = interaction.user
-        if guild is None or not isinstance(buyer, discord.Member):
-            await interaction.followup.send(
-                "❌ サーバー内でのみ購入できます。",
-                ephemeral=True,
-            )
-            return
-
+    async def on_submit(self, interaction: discord.Interaction):
         url = str(self.paypay_url.value).strip()
-        if not re.match(r"^https?://", url, re.I):
-            await interaction.followup.send(
-                "❌ URL形式が正しくありません。",
-                ephemeral=True,
-            )
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            await interaction.response.send_message("❌ 有効なURLを入力してください。", ephemeral=True)
             return
 
         async with purchase_lock:
             product = find_product(self.product_id)
-            if not product or not product.get("enabled", True):
-                await interaction.followup.send(
-                    "❌ この商品は販売停止になりました。",
-                    ephemeral=True,
-                )
+            if not product or not product.get("active", True):
+                await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
                 return
 
             stock = int(product.get("stock", 0))
             if stock <= 0:
-                await interaction.followup.send(
-                    "❌ 売り切れになりました。",
-                    ephemeral=True,
-                )
+                await interaction.response.send_message("❌ 申し訳ありません。在庫切れになりました。", ephemeral=True)
                 return
 
-            oid = next_order_id()
+            product["stock"] = stock - 1
+            order_id = next_order_id()
             order = {
-                "id": oid,
-                "guild_id": guild.id,
-                "buyer_id": buyer.id,
-                "buyer_name": str(buyer),
-                "product_id": product["id"],
-                "product_name": product["name"],
-                "price": int(product["price"]),
+                "id": order_id,
+                "product_id": self.product_id,
+                "buyer_id": interaction.user.id,
+                "guild_id": interaction.guild_id,
+                "price": int(product.get("price", 0)),
                 "paypay_url": url,
                 "status": "pending",
                 "created_at": now_iso(),
                 "ticket_channel_id": 0,
-                "cancelled_stock_returned": False,
             }
-
-            product["stock"] = stock - 1
-            orders[oid] = order
+            orders[order_id] = order
             save_json(PRODUCTS_FILE, products)
             save_json(ORDERS_FILE, orders)
 
         await update_purchase_panel()
 
         ticket = None
-        ticket_error = None
         try:
-            ticket = await create_ticket(order, guild, buyer)
-        except Exception as e:
-            ticket_error = str(e)
-            print(f"[PURCHASE] 専用チャット作成失敗 #{oid}: {e}")
-
-        notify_error = None
-        try:
-            order_channel = await get_or_create_order_channel(guild)
-            await order_channel.send(
-                embed=order_embed(order),
-                view=OrderAdminView(oid),
-            )
-        except Exception as e:
-            notify_error = str(e)
-            print(f"[PURCHASE] 注文通知送信失敗 #{oid}: {e}")
+            ticket = await create_ticket(order, interaction.guild, interaction.user)
+        except Exception:
+            traceback.print_exc()
 
         try:
-            await buyer.send(
-                embed=discord.Embed(
-                    title=f"🧾 注文 #{oid}",
-                    description=(
-                        f"**{order['product_name']}**\n"
-                        f"金額: **{money(order['price'])}**\n\n"
-                        "注文を受け付けました。\n"
-                        "管理者の入金確認をお待ちください。"
-                    ),
-                    color=int(config["design"]["color"]),
-                )
+            order_channel = await get_or_create_order_channel(interaction.guild)
+            await order_channel.send(embed=order_embed(order), view=OrderAdminView(order_id))
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            await interaction.user.send(
+                f"🧾 **{order_id}** の注文を受け付けました。\n"
+                f"商品: **{product.get('name', '商品')}**\n"
+                f"金額: **{money(product.get('price', 0))}**\n"
+                f"状態: **支払い確認待ち**"
             )
-        except discord.HTTPException:
+        except (discord.Forbidden, discord.HTTPException):
             pass
 
-        message = (
-            f"✅ 注文 **#{oid}** を受け付けました！\n"
-            f"商品: **{order['product_name']}**\n"
-            f"金額: **{money(order['price'])}**"
-        )
+        message = f"✅ 購入受付完了！\n注文番号: **{order_id}**"
         if ticket:
-            message += f"\n💬 専用チャット: {ticket.mention}"
+            message += f"\n専用チャット: {ticket.mention}"
         else:
-            message += "\n⚠️ 専用チャット作成に失敗しました。管理者へ通知されています。"
-        if ticket_error:
-            print(f"[PURCHASE] ticket_error #{oid}: {ticket_error}")
-        if notify_error:
-            message += "\n⚠️ 管理通知の送信にも失敗しています。"
+            message += "\n⚠️ 専用チャットの作成に失敗したため、管理者へご連絡ください。"
 
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
-        )
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 # ============================================================
-# 注文通知UI
+# 注文管理
 # ============================================================
 
+class ProcessedOrderView(discord.ui.View):
+    """支払い確認・キャンセル後に表示する固定ビュー。"""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-def order_embed(order):
-    status = {
-        "pending": "🟡 入金確認待ち",
-        "paid": "🟢 支払い確認済み",
-        "cancelled": "🔴 キャンセル",
-        "completed": "🔵 完了",
-    }.get(order.get("status"), order.get("status", "不明"))
 
-    embed = discord.Embed(
-        title=f"🛒 新しい注文 #{order['id']}",
-        color=discord.Color.orange() if order.get("status") == "pending" else discord.Color.green(),
-    )
-    embed.add_field(
-        name="👤 購入者",
-        value=f"<@{order['buyer_id']}>",
-        inline=True,
-    )
-    embed.add_field(
-        name="📦 商品",
-        value=order["product_name"],
-        inline=True,
-    )
-    embed.add_field(
-        name="💰 金額",
-        value=money(order["price"]),
-        inline=True,
-    )
-    embed.add_field(
-        name="📌 状態",
-        value=status,
-        inline=False,
-    )
-    embed.add_field(
-        name="💳 PayPay URL",
-        value=order["paypay_url"][:1024],
-        inline=False,
-    )
-    embed.set_footer(text=f"注文日時: {order['created_at']}")
-    return embed
+async def process_paid_order(interaction, order_id):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+    order = orders.get(order_id)
+    if not order:
+        await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
+        return
+    if order.get("status") == "cancelled":
+        await interaction.response.send_message("❌ キャンセル済み注文です。", ephemeral=True)
+        return
+    order["status"] = "paid"
+    order["paid_at"] = now_iso()
+    save_json(ORDERS_FILE, orders)
+    await interaction.response.edit_message(embed=order_embed(order), view=ProcessedOrderView())
+    try:
+        user = interaction.guild.get_member(int(order["buyer_id"])) or await interaction.guild.fetch_member(int(order["buyer_id"]))
+        await user.send(f"🟢 注文 **{order_id}** の支払い確認が完了しました！")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+        pass
 
 
 class OrderPaidButton(discord.ui.Button):
     def __init__(self, order_id):
-        super().__init__(
-            label="支払い確認",
-            emoji="✅",
-            style=discord.ButtonStyle.success,
-            custom_id=f"kira:order:paid:{order_id}",
-        )
+        super().__init__(label="支払い確認", emoji="✅", style=discord.ButtonStyle.success, custom_id=f"kira:paid:{order_id}")
         self.order_id = order_id
 
-    async def callback(self, interaction):
-        if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return
+    async def callback(self, interaction: discord.Interaction):
+        await process_paid_order(interaction, self.order_id)
 
-        order = orders.get(self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
-            return
-        if order.get("status") in ("cancelled", "completed"):
-            await interaction.response.send_message("❌ この注文はすでに処理済みです。", ephemeral=True)
-            return
 
-        order["status"] = "paid"
-        order["paid_at"] = now_iso()
-        save_json(ORDERS_FILE, orders)
-
-        await interaction.response.edit_message(
-            embed=order_embed(order),
-            view=ProcessedOrderView(),
-        )
-
-        try:
-            buyer = await interaction.client.fetch_user(int(order["buyer_id"]))
-            await buyer.send(f"✅ 注文 #{self.order_id} の支払いを確認しました。")
-        except discord.HTTPException:
-            pass
+async def process_cancel_order(interaction, order_id):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+    order = orders.get(order_id)
+    if not order:
+        await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
+        return
+    if order.get("status") == "cancelled":
+        await interaction.response.send_message("❌ すでにキャンセルされています。", ephemeral=True)
+        return
+    if order.get("status") == "paid":
+        await interaction.response.send_message("❌ 支払い確認済みの注文はこのボタンからキャンセルできません。", ephemeral=True)
+        return
+    product = find_product(order.get("product_id"))
+    if product:
+        product["stock"] = int(product.get("stock", 0)) + 1
+        save_json(PRODUCTS_FILE, products)
+    order["status"] = "cancelled"
+    order["cancelled_at"] = now_iso()
+    save_json(ORDERS_FILE, orders)
+    await update_purchase_panel()
+    await interaction.response.edit_message(embed=order_embed(order), view=ProcessedOrderView())
+    try:
+        user = interaction.guild.get_member(int(order["buyer_id"])) or await interaction.guild.fetch_member(int(order["buyer_id"]))
+        await user.send(f"🔴 注文 **{order_id}** はキャンセルされました。")
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
+        pass
 
 
 class OrderCancelButton(discord.ui.Button):
     def __init__(self, order_id):
-        super().__init__(
-            label="キャンセル",
-            emoji="❌",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"kira:order:cancel:{order_id}",
-        )
+        super().__init__(label="キャンセル", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id=f"kira:cancel:{order_id}")
         self.order_id = order_id
 
-    async def callback(self, interaction):
-        if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return
-
-        order = orders.get(self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
-            return
-        if order.get("status") in ("cancelled", "completed"):
-            await interaction.response.send_message("❌ この注文はすでに処理済みです。", ephemeral=True)
-            return
-
-        if not order.get("cancelled_stock_returned", False):
-            product = find_product(order.get("product_id"))
-            if product:
-                product["stock"] = int(product.get("stock", 0)) + 1
-                save_json(PRODUCTS_FILE, products)
-            order["cancelled_stock_returned"] = True
-
-        order["status"] = "cancelled"
-        order["cancelled_at"] = now_iso()
-        save_json(ORDERS_FILE, orders)
-
-        await update_purchase_panel()
-        await interaction.response.edit_message(
-            embed=order_embed(order),
-            view=ProcessedOrderView(),
-        )
+    async def callback(self, interaction: discord.Interaction):
+        await process_cancel_order(interaction, self.order_id)
 
 
 class OrderAdminView(discord.ui.View):
     def __init__(self, order_id):
         super().__init__(timeout=None)
-        self.order_id = order_id
         self.add_item(OrderPaidButton(order_id))
         self.add_item(OrderCancelButton(order_id))
 
-    async def interaction_check(self, interaction):
-        if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
-
 
 # ============================================================
-# Ticket UI
+# チケット
 # ============================================================
 
 class TicketArchiveButton(discord.ui.Button):
-    def __init__(self, order_id):
-        super().__init__(
-            label="履歴として保存",
-            emoji="🗃️",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"kira:ticket:archive:{order_id}",
-        )
+    def __init__(self, order_id, buyer_id):
+        super().__init__(label="購入履歴へ", emoji="📁", style=discord.ButtonStyle.secondary, custom_id=f"kira:archive:{order_id}")
         self.order_id = order_id
+        self.buyer_id = buyer_id
 
-    async def callback(self, interaction):
-        order = orders.get(self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        if not (is_admin(interaction.user) or interaction.user.id == self.buyer_id):
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
             return
-
-        if not (
-            is_admin(interaction.user)
-            or interaction.user.id == int(order["buyer_id"])
-        ):
-            await interaction.response.send_message("🔒 権限がありません。", ephemeral=True)
-            return
-
-        try:
-            category = await get_or_create_category(
-                interaction.guild,
-                "📁 購入履歴",
-                "archive_category_id",
-            )
-            await interaction.channel.edit(
-                category=category,
-                name=f"history-kira-{self.order_id}",
-            )
-            await interaction.response.send_message(
-                "🗃️ 履歴として保存しました。",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.response.send_message(
-                f"❌ 履歴保存に失敗しました: `{e}`",
-                ephemeral=True,
-            )
+        category = await get_or_create_archive_category(interaction.guild)
+        await interaction.channel.edit(category=category, reason=f"{BOT_NAME} 購入履歴へ移動")
+        await interaction.response.send_message("📁 購入履歴へ移動しました。", ephemeral=True)
 
 
 class TicketDeleteButton(discord.ui.Button):
-    def __init__(self, order_id):
-        super().__init__(
-            label="チャット削除",
-            emoji="🗑️",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"kira:ticket:delete:{order_id}",
-        )
+    def __init__(self, order_id, buyer_id):
+        super().__init__(label="チャット削除", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id=f"kira:delete_ticket:{order_id}")
         self.order_id = order_id
+        self.buyer_id = buyer_id
 
-    async def callback(self, interaction):
-        order = orders.get(self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        if not (is_admin(interaction.user) or interaction.user.id == self.buyer_id):
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
             return
-
-        if not (
-            is_admin(interaction.user)
-            or interaction.user.id == int(order["buyer_id"])
-        ):
-            await interaction.response.send_message("🔒 権限がありません。", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            "🗑️ 専用チャットを削除します。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("🗑️ チャットを削除します。", ephemeral=True)
         await asyncio.sleep(1)
         try:
-            await interaction.channel.delete(
-                reason=f"注文 #{self.order_id} 専用チャット削除"
-            )
-        except discord.HTTPException as e:
-            print(f"[TICKET DELETE] {e}")
+            await interaction.channel.delete(reason=f"{BOT_NAME} チケット削除")
+        except discord.HTTPException:
+            pass
 
 
 class TicketView(discord.ui.View):
-    def __init__(self, order_id):
+    def __init__(self, order_id, buyer_id):
         super().__init__(timeout=None)
-        self.order_id = order_id
-        self.add_item(TicketArchiveButton(order_id))
-        self.add_item(TicketDeleteButton(order_id))
-
-    async def interaction_check(self, interaction):
-        order = orders.get(self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
-            return False
-
-        if not (
-            is_admin(interaction.user)
-            or interaction.user.id == int(order["buyer_id"])
-        ):
-            await interaction.response.send_message("🔒 権限がありません。", ephemeral=True)
-            return False
-        return True
+        self.add_item(TicketArchiveButton(order_id, buyer_id))
+        self.add_item(TicketDeleteButton(order_id, buyer_id))
 
 
 # ============================================================
 # 商品管理
 # ============================================================
 
-class ProductModal(discord.ui.Modal, title="➕ 商品追加"):
-    name = discord.ui.TextInput(label="商品名", max_length=80)
-    price = discord.ui.TextInput(label="価格", placeholder="500")
-    stock = discord.ui.TextInput(label="在庫数", placeholder="10")
-    emoji = discord.ui.TextInput(label="絵文字（通常/カスタム）", required=False, default="🛒", max_length=100)
-    description = discord.ui.TextInput(
-        label="説明",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=500,
-    )
+class ProductModal(discord.ui.Modal, title="商品を追加"):
+    name = discord.ui.TextInput(label="商品名", placeholder="例：Amazonギフト券", max_length=80)
+    price = discord.ui.TextInput(label="価格（数字のみ）", placeholder="1000", max_length=10)
+    stock = discord.ui.TextInput(label="在庫数", placeholder="10", max_length=8)
+    emoji = discord.ui.TextInput(label="絵文字", placeholder="🎁", required=False, max_length=20)
+    description = discord.ui.TextInput(label="商品説明", placeholder="商品の説明を入力", required=False, style=discord.TextStyle.paragraph, max_length=1000)
 
-    async def on_submit(self, interaction):
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         try:
-            price = int(str(self.price.value).replace(",", ""))
-            stock = int(str(self.stock.value))
-            if price <= 0 or stock < 0:
+            price = int(str(self.price.value).replace(",", "").strip())
+            stock = int(str(self.stock.value).strip())
+            if price < 0 or stock < 0:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message(
-                "❌ 価格は1以上、在庫は0以上の数字で入力してください。",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ 価格と在庫数は0以上の数字で入力してください。", ephemeral=True)
             return
 
-        pid = re.sub(r"[^a-z0-9_-]", "-", str(self.name.value).lower())[:30]
-        pid = pid or f"product-{len(products)+1}"
-        if find_product(pid):
-            pid = f"{pid}-{len(products)+1}"
-
-        products.append(
-            {
-                "id": pid,
-                "name": str(self.name.value),
-                "description": str(self.description.value),
-                "price": price,
-                "stock": stock,
-                "emoji": str(self.emoji.value) or "🛒",
-                "image_url": "",
-                "enabled": True,
-            }
-        )
+        pid = unique_product_id(self.name.value)
+        products[pid] = {
+            "id": pid,
+            "name": str(self.name.value).strip(),
+            "description": str(self.description.value).strip(),
+            "price": price,
+            "stock": stock,
+            "active": True,
+            "image_url": "",
+            "emoji": str(self.emoji.value).strip() or "🛍️",
+        }
         save_json(PRODUCTS_FILE, products)
         await update_purchase_panel()
         await interaction.response.send_message(
-            f"✅ 商品を追加しました。\n商品ID: `{pid}`",
+            f"✅ 商品を追加しました。\n**{products[pid]['name']}** / {money(price)} / 在庫 {stock}\n\n📷 商品画像を付けたい場合は、管理パネルの **「画像を設定」** または `/product_image` を使えます。",
             ephemeral=True,
         )
 
 
-class ProductEditModal(discord.ui.Modal, title="✏️ 商品編集"):
-    def __init__(self, pid):
-        super().__init__()
-        self.pid = pid
-        p = find_product(pid)
-        self.name = discord.ui.TextInput(label="商品名", default=p["name"], max_length=80)
-        self.price = discord.ui.TextInput(label="価格", default=str(p["price"]))
-        self.stock = discord.ui.TextInput(label="在庫", default=str(p["stock"]))
-        self.emoji = discord.ui.TextInput(label="絵文字（通常/カスタム）", default=p.get("emoji", "🛒"), max_length=100)
-        self.description = discord.ui.TextInput(
-            label="説明",
-            default=p.get("description", ""),
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=500,
-        )
-        for item in [self.name, self.price, self.stock, self.emoji, self.description]:
-            self.add_item(item)
+class ProductEditModal(discord.ui.Modal, title="商品を編集"):
+    name = discord.ui.TextInput(label="商品名", max_length=80)
+    price = discord.ui.TextInput(label="価格", max_length=10)
+    description = discord.ui.TextInput(label="商品説明", required=False, style=discord.TextStyle.paragraph, max_length=1000)
+    emoji = discord.ui.TextInput(label="絵文字", required=False, max_length=20)
 
-    async def on_submit(self, interaction):
-        p = find_product(self.pid)
-        if not p:
-            await interaction.response.send_message("❌ 商品がありません。", ephemeral=True)
+    def __init__(self, product_id):
+        super().__init__()
+        self.product_id = product_id
+        product = find_product(product_id) or {}
+        self.name.default = str(product.get("name", ""))
+        self.price.default = str(product.get("price", 0))
+        self.description.default = str(product.get("description", ""))
+        self.emoji.default = str(product.get("emoji", "🛍️"))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        product = find_product(self.product_id)
+        if not product:
+            await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
             return
         try:
-            price = int(str(self.price.value).replace(",", ""))
-            stock = int(str(self.stock.value))
-            if price <= 0 or stock < 0:
+            price = int(str(self.price.value).replace(",", "").strip())
+            if price < 0:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message("❌ 価格/在庫が正しくありません。", ephemeral=True)
+            await interaction.response.send_message("❌ 価格は0以上の数字で入力してください。", ephemeral=True)
             return
-
-        p["name"] = str(self.name.value)
-        p["price"] = price
-        p["stock"] = stock
-        p["emoji"] = str(self.emoji.value) or "🛒"
-        p["description"] = str(self.description.value)
+        product["name"] = str(self.name.value).strip()
+        product["price"] = price
+        product["description"] = str(self.description.value).strip()
+        product["emoji"] = str(self.emoji.value).strip() or "🛍️"
         save_json(PRODUCTS_FILE, products)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ 商品を更新しました。", ephemeral=True)
+        await interaction.response.send_message("✅ 商品情報を更新しました。", ephemeral=True)
 
 
-class ProductSelect(discord.ui.Select):
-    def __init__(self, mode):
-        self.mode = mode
-        options = [
-            discord.SelectOption(
-                label=p["name"][:100],
-                value=p["id"],
-                description=f"{money(p['price'])} / 在庫 {p['stock']}",
-            )
-            for p in products[:25]
-        ]
-        super().__init__(
-            placeholder="商品を選択",
-            options=options,
-        )
+class StockModal(discord.ui.Modal, title="在庫を変更"):
+    stock = discord.ui.TextInput(label="新しい在庫数", placeholder="10", max_length=8)
 
-    async def callback(self, interaction):
-        pid = self.values[0]
-        if self.mode == "edit":
-            await interaction.response.send_modal(ProductEditModal(pid))
-            return
-
-        if self.mode == "delete":
-            p = find_product(pid)
-            if p:
-                products.remove(p)
-                save_json(PRODUCTS_FILE, products)
-                await update_purchase_panel()
-                await interaction.response.send_message(
-                    f"🗑️ `{p['name']}` を削除しました。",
-                    ephemeral=True,
-                )
-            return
-
-        if self.mode == "stock":
-            await interaction.response.send_modal(StockModal(pid))
-            return
-
-        if self.mode == "toggle":
-            product = find_product(pid)
-            if not product:
-                return await interaction.response.send_message("❌ 商品がありません。", ephemeral=True)
-            product["enabled"] = not product.get("enabled", True)
-            save_json(PRODUCTS_FILE, products)
-            await update_purchase_panel()
-            state = "販売中" if product["enabled"] else "販売停止"
-            await interaction.response.send_message(
-                f"✅ `{product['name']}` を **{state}** にしました。",
-                ephemeral=True,
-            )
-
-
-class ProductSelectView(discord.ui.View):
-    def __init__(self, mode):
-        super().__init__(timeout=180)
-        if products:
-            self.add_item(ProductSelect(mode))
-
-
-class StockModal(discord.ui.Modal, title="📦 在庫変更"):
-    stock = discord.ui.TextInput(label="新しい在庫数", placeholder="10")
-
-    def __init__(self, pid):
+    def __init__(self, product_id):
         super().__init__()
-        self.pid = pid
+        self.product_id = product_id
+        product = find_product(product_id) or {}
+        self.stock.default = str(product.get("stock", 0))
 
-    async def on_submit(self, interaction):
-        p = find_product(self.pid)
-        if not p:
-            await interaction.response.send_message("❌ 商品がありません。", ephemeral=True)
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
         try:
-            value = int(str(self.stock.value))
-            if value < 0:
+            stock = int(str(self.stock.value).strip())
+            if stock < 0:
                 raise ValueError
         except ValueError:
             await interaction.response.send_message("❌ 0以上の数字を入力してください。", ephemeral=True)
             return
-
-        p["stock"] = value
+        product = find_product(self.product_id)
+        if not product:
+            await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
+            return
+        product["stock"] = stock
         save_json(PRODUCTS_FILE, products)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ 在庫を変更しました。", ephemeral=True)
+        await interaction.response.send_message(f"✅ 在庫を **{stock}個** に変更しました。", ephemeral=True)
+
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, action):
+        self.action = action
+        options = []
+        for p in list(products.values())[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=str(p.get("name", "商品"))[:100],
+                    value=str(p.get("id")),
+                    emoji=p.get("emoji") or "🛍️",
+                    description=f"{money(p.get('price', 0))} / 在庫 {p.get('stock', 0)}"[:100],
+                )
+            )
+        if not options:
+            options = [discord.SelectOption(label="商品なし", value="__none__", description="先に商品を追加してください。")]
+        super().__init__(placeholder="商品を選択してください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        pid = self.values[0]
+        if pid == "__none__":
+            await interaction.response.send_message("商品がありません。", ephemeral=True)
+            return
+        product = find_product(pid)
+        if not product:
+            await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
+            return
+
+        if self.action == "edit":
+            await interaction.response.send_modal(ProductEditModal(pid))
+        elif self.action == "stock":
+            await interaction.response.send_modal(StockModal(pid))
+        elif self.action == "delete":
+            del products[pid]
+            save_json(PRODUCTS_FILE, products)
+            await update_purchase_panel()
+            await interaction.response.send_message(f"🗑️ **{product.get('name')}** を削除しました。", ephemeral=True)
+        elif self.action == "toggle":
+            product["active"] = not bool(product.get("active", True))
+            save_json(PRODUCTS_FILE, products)
+            await update_purchase_panel()
+            state = "販売中" if product["active"] else "非公開"
+            await interaction.response.send_message(f"✅ **{product.get('name')}** を **{state}** にしました。", ephemeral=True)
+
+
+class ProductSelectView(discord.ui.View):
+    def __init__(self, action):
+        super().__init__(timeout=120)
+        self.add_item(ProductSelect(action))
 
 
 class ProductAdminView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=180)
 
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="商品を追加", emoji="➕", style=discord.ButtonStyle.success, row=0)
+    async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "🔒 管理者専用です。",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(label="商品追加", emoji="➕", style=discord.ButtonStyle.success, row=0)
-    async def add(self, interaction, button):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         await interaction.response.send_modal(ProductModal())
 
-    @discord.ui.button(label="商品編集", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
-    async def edit(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
+    @discord.ui.button(label="商品を編集", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("編集する商品を選択してください。", view=ProductSelectView("edit"), ephemeral=True)
+
+    @discord.ui.button(label="在庫変更", emoji="📦", style=discord.ButtonStyle.primary, row=0)
+    async def stock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("在庫を変更する商品を選択してください。", view=ProductSelectView("stock"), ephemeral=True)
+
+    @discord.ui.button(label="販売ON/OFF", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("切り替える商品を選択してください。", view=ProductSelectView("toggle"), ephemeral=True)
+
+    @discord.ui.button(label="商品削除", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("削除する商品を選択してください。", view=ProductSelectView("delete"), ephemeral=True)
+
+    @discord.ui.button(label="画像を設定", emoji="🖼️", style=discord.ButtonStyle.primary, row=1)
+    async def image(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "編集する商品を選択してください。",
-            view=ProductSelectView("edit"),
+            "📷 商品画像を設定するには **/product_image** を使用してください。\n画像ファイルをそのコマンドの添付欄から直接アップロードできます。",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="在庫変更", emoji="📦", style=discord.ButtonStyle.secondary, row=0)
-    async def stock(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "在庫を変更する商品を選択してください。",
-            view=ProductSelectView("stock"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="販売ON/OFF", emoji="🔘", style=discord.ButtonStyle.secondary, row=1)
-    async def toggle(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "販売状態を変更する商品を選択してください。",
-            view=ProductSelectView("toggle"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="商品削除", emoji="🗑️", style=discord.ButtonStyle.danger, row=0)
-    async def delete(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "削除する商品を選択してください。",
-            view=ProductSelectView("delete"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="画像/GIF", emoji="🖼️", style=discord.ButtonStyle.secondary, row=1)
-    async def image(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "画像/GIFを設定する商品を選択してください。",
-            view=ProductMediaProductSelectView(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="商品プレビュー", emoji="👁️", style=discord.ButtonStyle.secondary, row=1)
-    async def preview(self, interaction, button):
-        if not products:
-            return await interaction.response.send_message("商品がありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "プレビューする商品を選択してください。",
-            view=ProductPreviewSelectView(),
-            ephemeral=True,
-        )
-
+    @discord.ui.button(label="プレビュー", emoji="👀", style=discord.ButtonStyle.secondary, row=2)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        active = [p for p in products.values() if p.get("active", True)]
+        if not active:
+            await interaction.response.send_message("現在販売中の商品はありません。", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=product_embed(active[0]), ephemeral=True)
 
 
 # ============================================================
 # デザイン管理
 # ============================================================
 
-class DesignTextModal(discord.ui.Modal, title="✏️ 販売機テキスト"):
-    def __init__(self):
-        super().__init__()
-        d = config["design"]
-        self.title_text = discord.ui.TextInput(
-            label="タイトル",
-            default=d.get("title", "🛒 キラの自動販売機"),
-            max_length=256,
-        )
-        self.subtitle = discord.ui.TextInput(
-            label="サブタイトル",
-            default=d.get("subtitle", ""),
-            max_length=256,
-        )
-        self.description = discord.ui.TextInput(
-            label="説明",
-            default=d.get("description", ""),
-            style=discord.TextStyle.paragraph,
-            max_length=1000,
-        )
-        self.notice = discord.ui.TextInput(
-            label="お知らせ",
-            default=d.get("notice", ""),
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=1000,
-        )
-        self.footer = discord.ui.TextInput(
-            label="フッター",
-            default=d.get("footer", ""),
-            required=False,
-            max_length=256,
-        )
-        for item in (
-            self.title_text,
-            self.subtitle,
-            self.description,
-            self.notice,
-            self.footer,
-        ):
-            self.add_item(item)
+class DesignTextModal(discord.ui.Modal, title="販売機の文章を編集"):
+    title_text = discord.ui.TextInput(label="タイトル", max_length=256)
+    subtitle = discord.ui.TextInput(label="サブタイトル", max_length=256, required=False)
+    description = discord.ui.TextInput(label="説明文", style=discord.TextStyle.paragraph, max_length=2000, required=False)
+    notice = discord.ui.TextInput(label="お知らせ", style=discord.TextStyle.paragraph, max_length=1000, required=False)
+    footer = discord.ui.TextInput(label="フッター", max_length=256, required=False)
 
-    async def on_submit(self, interaction):
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         d = config["design"]
-        d["title"] = str(self.title_text.value)
-        d["subtitle"] = str(self.subtitle.value)
-        d["description"] = str(self.description.value)
-        d["notice"] = str(self.notice.value)
-        d["footer"] = str(self.footer.value)
+        d["title"] = str(self.title_text.value).strip() or BOT_NAME
+        d["subtitle"] = str(self.subtitle.value).strip()
+        d["description"] = str(self.description.value).strip()
+        d["notice"] = str(self.notice.value).strip()
+        d["footer"] = str(self.footer.value).strip()
         save_json(CONFIG_FILE, config)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ デザインを保存しました。", ephemeral=True)
+        await interaction.response.send_message("✅ 販売機の文章を更新しました。", ephemeral=True)
 
 
-class ColorModal(discord.ui.Modal, title="🎨 色設定"):
-    def __init__(self):
-        super().__init__()
-        current = int(config["design"].get("color", 0x8B5CF6))
-        self.hex_color = discord.ui.TextInput(
-            label="16進カラー",
-            placeholder="#8B5CF6",
-            default=f"#{current:06X}",
-        )
-        self.add_item(self.hex_color)
+class ColorModal(discord.ui.Modal, title="色を変更"):
+    color = discord.ui.TextInput(label="カラーコード", placeholder="#5865F2 または 5865F2", max_length=7)
 
-    async def on_submit(self, interaction):
-        value = str(self.hex_color.value).strip().replace("#", "")
-        try:
-            number = int(value, 16)
-            if number < 0 or number > 0xFFFFFF:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message(
-                "❌ `#8B5CF6` のような形式で入力してください。",
-                ephemeral=True,
-            )
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-
-        config["design"]["color"] = number
+        raw = str(self.color.value).strip().lstrip("#")
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", raw):
+            await interaction.response.send_message("❌ 6桁のカラーコードを入力してください。", ephemeral=True)
+            return
+        config["design"]["color"] = int(raw, 16)
         save_json(CONFIG_FILE, config)
         await update_purchase_panel()
         await interaction.response.send_message("✅ 色を変更しました。", ephemeral=True)
 
 
-class BannerModal(discord.ui.Modal, title="🖼️ バナー/GIF"):
-    def __init__(self):
-        super().__init__()
-        self.url = discord.ui.TextInput(
-            label="画像/GIF URL",
-            placeholder="https://...",
-            default=config["design"].get("banner_url", ""),
-            required=False,
-            max_length=1000,
-        )
-        self.add_item(self.url)
+class BannerModal(discord.ui.Modal, title="バナーURLを変更"):
+    url = discord.ui.TextInput(label="画像URL", placeholder="https://...", required=False, max_length=500)
 
-    async def on_submit(self, interaction):
-        value = str(self.url.value).strip()
-        if value and not re.match(r"^https?://", value, re.I):
-            await interaction.response.send_message(
-                "❌ http(s) のURLを入力してください。",
-                ephemeral=True,
-            )
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-
-        config["design"]["banner_url"] = value
+        url = str(self.url.value).strip()
+        if url and not re.match(r"^https?://", url, re.IGNORECASE):
+            await interaction.response.send_message("❌ 有効なhttp/https URLを入力してください。", ephemeral=True)
+            return
+        config["design"]["banner_url"] = url
         save_json(CONFIG_FILE, config)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ バナー/GIFを保存しました。", ephemeral=True)
+        await interaction.response.send_message("✅ バナーを更新しました。", ephemeral=True)
 
 
 class DesignPresetView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
+    @discord.ui.button(label="デフォルト", emoji="🟣", style=discord.ButtonStyle.secondary)
+    async def default(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.apply(interaction, 0x5865F2, "🛒 キラの自動販売機")
 
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="パープル", emoji="💜", style=discord.ButtonStyle.primary)
+    async def purple(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.apply(interaction, 0x9B59B6, "💜 キラの自動販売機")
+
+    @discord.ui.button(label="ブルー", emoji="💙", style=discord.ButtonStyle.primary)
+    async def blue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.apply(interaction, 0x3498DB, "💙 キラの自動販売機")
+
+    async def apply(self, interaction, color, title):
         if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="現在のデザインを維持", emoji="✅", style=discord.ButtonStyle.success, row=0)
-    async def keep(self, interaction, button):
-        await interaction.response.send_message(
-            "✅ 現在のデザインを維持します。",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="紫", emoji="🟣", style=discord.ButtonStyle.secondary, row=0)
-    async def purple(self, interaction, button):
-        config["design"]["color"] = 0x8B5CF6
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        config["design"]["color"] = color
+        config["design"]["title"] = title
         save_json(CONFIG_FILE, config)
         await update_purchase_panel()
-        await interaction.response.send_message("🟣 紫にしました。", ephemeral=True)
-
-    @discord.ui.button(label="青", emoji="🔵", style=discord.ButtonStyle.secondary, row=0)
-    async def blue(self, interaction, button):
-        config["design"]["color"] = 0x5865F2
-        save_json(CONFIG_FILE, config)
-        await update_purchase_panel()
-        await interaction.response.send_message("🔵 青にしました。", ephemeral=True)
+        await interaction.response.send_message("✅ プリセットを適用しました。", ephemeral=True)
 
 
 class DesignView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="文章", emoji="📝", style=discord.ButtonStyle.primary, row=0)
+    async def text(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        modal = DesignTextModal()
+        d = config["design"]
+        modal.title_text.default = d.get("title", BOT_NAME)
+        modal.subtitle.default = d.get("subtitle", "")
+        modal.description.default = d.get("description", "")
+        modal.notice.default = d.get("notice", "")
+        modal.footer.default = d.get("footer", "")
+        await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="文字を設定", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
-    async def text(self, interaction, button):
-        await interaction.response.send_modal(DesignTextModal())
-
-    @discord.ui.button(label="色を設定", emoji="🎨", style=discord.ButtonStyle.secondary, row=0)
-    async def color(self, interaction, button):
+    @discord.ui.button(label="色", emoji="🎨", style=discord.ButtonStyle.primary, row=0)
+    async def color(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         await interaction.response.send_modal(ColorModal())
 
-    @discord.ui.button(label="バナー/GIF", emoji="🖼️", style=discord.ButtonStyle.secondary, row=0)
-    async def banner(self, interaction, button):
+    @discord.ui.button(label="バナー", emoji="🖼️", style=discord.ButtonStyle.primary, row=0)
+    async def banner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         await interaction.response.send_modal(BannerModal())
 
-    @discord.ui.button(label="かんたん色変更", emoji="✨", style=discord.ButtonStyle.secondary, row=1)
-    async def presets(self, interaction, button):
-        await interaction.response.send_message(
-            "かんたんな色設定です。現在の他のデザインは変更しません。",
-            view=DesignPresetView(),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="プリセット", emoji="✨", style=discord.ButtonStyle.secondary, row=1)
+    async def presets(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("デザインを選択してください。", view=DesignPresetView(), ephemeral=True)
 
-    @discord.ui.button(label="プレビュー", emoji="👁️", style=discord.ButtonStyle.success, row=1)
-    async def preview(self, interaction, button):
-        banner = config["design"].get("banner_url", "")
-        await interaction.response.send_message(
-            content=banner if banner.startswith("http") else None,
-            embed=design_embed(),
-            view=PurchaseView(),
-            ephemeral=True,
-        )
-
+    @discord.ui.button(label="プレビュー", emoji="👀", style=discord.ButtonStyle.secondary, row=1)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=design_embed(), view=PurchaseView(), ephemeral=True)
 
 
 # ============================================================
-# チャンネル / メディア
+# チャンネル設定
 # ============================================================
 
-class ChannelIdModal(discord.ui.Modal):
-    def __init__(self, key, title):
-        super().__init__(title=title)
-        self.key = key
-        self.value = discord.ui.TextInput(
-            label="チャンネルID",
-            placeholder="123456789012345678",
-        )
-        self.add_item(self.value)
+class ChannelIdModal(discord.ui.Modal, title="チャンネルを設定"):
+    purchase = discord.ui.TextInput(label="購入チャンネルID", placeholder="123456789...", required=False)
+    order = discord.ui.TextInput(label="注文通知チャンネルID", placeholder="123456789...", required=False)
+    media = discord.ui.TextInput(label="メディアチャンネルID", placeholder="123456789...", required=False)
 
-    async def on_submit(self, interaction):
-        try:
-            cid = int(str(self.value.value).strip())
-        except ValueError:
-            await interaction.response.send_message("❌ チャンネルIDが正しくありません。", ephemeral=True)
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-
-        ch = interaction.guild.get_channel(cid)
-        if not isinstance(ch, discord.TextChannel):
-            await interaction.response.send_message("❌ そのチャンネルが見つかりません。", ephemeral=True)
-            return
-
-        perms = ch.permissions_for(interaction.guild.me)
-        if not (perms.view_channel and perms.send_messages):
-            await interaction.response.send_message("❌ Botがそのチャンネルを使用できません。", ephemeral=True)
-            return
-
-        config[self.key] = cid
+        for field, key in ((self.purchase, "purchase_channel_id"), (self.order, "order_channel_id"), (self.media, "media_channel_id")):
+            value = str(field.value).strip()
+            if value:
+                if not value.isdigit():
+                    await interaction.response.send_message(f"❌ {key} は数字のチャンネルIDで指定してください。", ephemeral=True)
+                    return
+                config[key] = int(value)
         save_json(CONFIG_FILE, config)
-        await interaction.response.send_message(
-            f"✅ {ch.mention} を設定しました。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("✅ チャンネル設定を更新しました。", ephemeral=True)
 
 
 class ChannelSettingsView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="チャンネルIDを設定", emoji="⚙️", style=discord.ButtonStyle.primary)
+    async def ids(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        modal = ChannelIdModal()
+        modal.purchase.default = str(config.get("purchase_channel_id", "") or "")
+        modal.order.default = str(config.get("order_channel_id", "") or "")
+        modal.media.default = str(config.get("media_channel_id", "") or "")
+        await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="購入チャンネルを設定", emoji="🛒", style=discord.ButtonStyle.primary)
-    async def purchase(self, interaction, button):
-        await interaction.response.send_modal(
-            ChannelIdModal("purchase_channel_id", "購入チャンネルID")
-        )
+    @discord.ui.button(label="購入チャンネルを自動作成", emoji="🛒", style=discord.ButtonStyle.success)
+    async def create_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        channel = await find_purchase_channel(interaction.guild, create=True)
+        await interaction.response.send_message(f"✅ 購入チャンネル: {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="注文通知を作成/確認", emoji="📦", style=discord.ButtonStyle.success)
-    async def order(self, interaction, button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            ch = await get_or_create_order_channel(interaction.guild)
-            await interaction.followup.send(
-                f"✅ 注文通知チャンネル: {ch.mention}",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ 注文通知チャンネル作成失敗: `{e}`",
-                ephemeral=True,
-            )
+    @discord.ui.button(label="注文通知を自動作成", emoji="🧾", style=discord.ButtonStyle.success)
+    async def create_order(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        channel = await get_or_create_order_channel(interaction.guild)
+        await interaction.response.send_message(f"✅ 注文通知: {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="メディアチャンネル作成", emoji="🎞️", style=discord.ButtonStyle.secondary)
-    async def media(self, interaction, button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild = interaction.guild
-        try:
-            existing = next(
-                (c for c in guild.text_channels if c.name == "vending-media"),
-                None,
-            )
-            if existing:
-                await secure_private_channel(existing, guild)
-                config["media_channel_id"] = existing.id
-                save_json(CONFIG_FILE, config)
-                await interaction.followup.send(
-                    f"✅ メディアチャンネル: {existing.mention}",
-                    ephemeral=True,
-                )
-                return
+    @discord.ui.button(label="メディアを自動作成", emoji="🖼️", style=discord.ButtonStyle.success)
+    async def create_media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        channel = await get_or_create_media_channel(interaction.guild)
+        await interaction.response.send_message(f"✅ メディア: {channel.mention}", ephemeral=True)
 
-            category = None
-            try:
-                category = await get_or_create_category(
-                    guild,
-                    "🔒 管理者エリア",
-                    "admin_category_id",
-                )
-            except Exception:
-                pass
 
-            try:
-                ch = await guild.create_text_channel(
-                    "vending-media",
-                    category=category,
-                    reason=f"{BOT_NAME} メディア保管チャンネル",
-                )
-            except discord.Forbidden:
-                ch = await guild.create_text_channel(
-                    "vending-media",
-                    reason=f"{BOT_NAME} メディア保管チャンネル再試行",
-                )
+# ============================================================
+# メディア管理
+# ============================================================
 
-            await secure_private_channel(ch, guild)
-            config["media_channel_id"] = ch.id
-            save_json(CONFIG_FILE, config)
-            await interaction.followup.send(
-                f"✅ メディアチャンネルを作成しました: {ch.mention}",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ メディアチャンネル作成失敗: `{e}`",
-                ephemeral=True,
-            )
+async def get_or_create_media_channel(guild):
+    channel_id = config.get("media_channel_id", 0)
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    channel = discord.utils.get(guild.text_channels, name="vending-media")
+    if channel is None:
+        channel = await guild.create_text_channel("vending-media", reason=f"{BOT_NAME} メディア保管")
+    await secure_private_channel(channel, guild)
+    config["media_channel_id"] = channel.id
+    save_json(CONFIG_FILE, config)
+    return channel
 
 
 class MediaView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="メディアチャンネルを開く", emoji="🖼️", style=discord.ButtonStyle.primary)
+    async def open_media(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        channel = await get_or_create_media_channel(interaction.guild)
+        await interaction.response.send_message(f"🖼️ {channel.mention}", ephemeral=True)
 
-    @discord.ui.button(label="メディアチャンネルを開く", emoji="🎞️", style=discord.ButtonStyle.primary)
-    async def open_media(self, interaction, button):
-        ch = interaction.guild.get_channel(int(config.get("media_channel_id", 0) or 0))
-        if isinstance(ch, discord.TextChannel):
-            await interaction.response.send_message(
-                f"ここにGIF/画像をドラッグ＆ドロップしてください: {ch.mention}\n"
-                "アップロードされた画像/GIFはメディアライブラリに自動登録されます。",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ 先にチャンネル設定からメディアチャンネルを作成してください。",
-                ephemeral=True,
-            )
+    @discord.ui.button(label="保存メディア一覧", emoji="📚", style=discord.ButtonStyle.secondary)
+    async def saved_media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        library = config.get("media_library", [])
+        if not library:
+            await interaction.response.send_message("保存されているメディアはありません。", ephemeral=True)
+            return
+        lines = []
+        for item in library[-20:]:
+            lines.append(f"• [{item.get('name', '画像')}]({item.get('url', '')})")
+        await interaction.response.send_message("📚 **保存メディア**\n" + "\n".join(lines), ephemeral=True)
 
-    @discord.ui.button(label="保存済みメディア", emoji="📚", style=discord.ButtonStyle.secondary)
-    async def library(self, interaction, button):
-        if not config.get("media_library", []):
-            return await interaction.response.send_message("❌ まだ画像/GIFがありません。メディアチャンネルへアップロードしてください。", ephemeral=True)
-        await interaction.response.send_message(
-            "バナー/GIFに使うメディアを選択してください。",
-            view=MediaLibraryView("banner"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="バナーURL設定", emoji="🖼️", style=discord.ButtonStyle.secondary)
-    async def banner(self, interaction, button):
+    @discord.ui.button(label="バナーURL設定", emoji="🎨", style=discord.ButtonStyle.secondary)
+    async def banner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
         await interaction.response.send_modal(BannerModal())
 
 
 # ============================================================
-# メディアライブラリ / 商品画像設定
+# 購入チャンネル
 # ============================================================
 
-class MediaLibrarySelect(discord.ui.Select):
-    def __init__(self, mode, product_id=0):
-        self.mode = mode
-        self.product_id = product_id
-        library = config.get("media_library", [])
-        options = []
-        for i, item in enumerate(library[:25]):
-            options.append(
-                discord.SelectOption(
-                    label=str(item.get("name", f"media-{i+1}"))[:100],
-                    description=str(item.get("type", "image"))[:100],
-                    value=str(i),
-                )
-            )
-        if not options:
-            options = [discord.SelectOption(label="メディアがありません", value="none")]
-        super().__init__(
-            placeholder="使用する画像/GIFを選択",
-            options=options,
-        )
+async def find_purchase_channel(guild, create=False):
+    channel_id = config.get("purchase_channel_id", 0)
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if isinstance(channel, discord.TextChannel):
+            return channel
 
-    async def callback(self, interaction):
-        if self.values[0] == "none":
-            return await interaction.response.send_message("❌ メディアがありません。", ephemeral=True)
-        library = config.get("media_library", [])
-        item = library[int(self.values[0])]
-        url = item.get("url", "")
-        if self.mode == "banner":
-            config["design"]["banner_url"] = url
-            save_json(CONFIG_FILE, config)
-            await update_purchase_panel()
-            await interaction.response.send_message("✅ バナー/GIFに設定しました。", ephemeral=True)
-            return
-        product = find_product(self.product_id)
-        if not product:
-            return await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
-        product["image_url"] = url
-        save_json(PRODUCTS_FILE, products)
-        await interaction.response.send_message(
-            f"✅ `{product['name']}` の画像/GIFを設定しました。",
-            ephemeral=True,
-        )
-
-
-class MediaLibraryView(discord.ui.View):
-    def __init__(self, mode, product_id=0):
-        super().__init__(timeout=300)
-        self.add_item(MediaLibrarySelect(mode, product_id))
-
-
-class ProductMediaProductSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(
-                label=p["name"][:100],
-                value=p["id"],
-                description="メディアを設定",
-            )
-            for p in products[:25]
-        ]
-        super().__init__(placeholder="商品を選択", options=options)
-
-    async def callback(self, interaction):
-        await interaction.response.send_message(
-            "使用する画像/GIFを選択してください。",
-            view=MediaLibraryView("product", self.values[0]),
-            ephemeral=True,
-        )
-
-
-class ProductMediaProductSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        if products:
-            self.add_item(ProductMediaProductSelect())
-
-
-class ProductPreviewSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(
-                label=p["name"][:100],
-                value=p["id"],
-            )
-            for p in products[:25]
-        ]
-        super().__init__(placeholder="プレビューする商品を選択", options=options)
-
-    async def callback(self, interaction):
-        p = find_product(self.values[0])
-        if not p:
-            return await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
-        embed = discord.Embed(
-            title=f"{p.get('emoji', '🛒')} {p['name']}",
-            description=(
-                f"{p.get('description', '')}\n\n"
-                f"💰 {money(p['price'])}\n"
-                f"📦 在庫 {p['stock']}"
-            ),
-            color=int(config["design"]["color"]),
-        )
-        if p.get("image_url", "").startswith("http"):
-            embed.set_image(url=p["image_url"])
-        await interaction.response.send_message(
-            embed=embed,
-            view=ProductDetailView(p["id"]),
-            ephemeral=True,
-        )
-
-
-class ProductPreviewSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        if products:
-            self.add_item(ProductPreviewSelect())
-
-
-# ============================================================
-# 管理画面
-# ============================================================
-
-async def find_purchase_channel(guild):
-    cid = int(config.get("purchase_channel_id", 0) or 0)
-    if cid:
-        ch = guild.get_channel(cid)
-        if isinstance(ch, discord.TextChannel):
-            return ch
-
-    ch = next(
-        (c for c in guild.text_channels if c.name == "購入"),
-        None,
-    )
-    if isinstance(ch, discord.TextChannel):
-        config["purchase_channel_id"] = ch.id
+    channel = discord.utils.get(guild.text_channels, name="購入")
+    if channel:
+        config["purchase_channel_id"] = channel.id
         save_json(CONFIG_FILE, config)
-        return ch
+        return channel
+
+    if create:
+        channel = await guild.create_text_channel("購入", reason=f"{BOT_NAME} 購入チャンネル")
+        config["purchase_channel_id"] = channel.id
+        save_json(CONFIG_FILE, config)
+        return channel
     return None
 
+
+async def update_purchase_panel():
+    channel_id = config.get("panel_channel_id", 0)
+    message_id = config.get("panel_message_id", 0)
+    if not channel_id or not message_id:
+        return False
+    channel = bot.get_channel(int(channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(embed=design_embed(), view=PurchaseView())
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def deploy_purchase_panel(guild):
+    channel = await find_purchase_channel(guild, create=True)
+    existing = None
+    if config.get("panel_message_id") and config.get("panel_channel_id") == channel.id:
+        try:
+            existing = await channel.fetch_message(int(config["panel_message_id"]))
+        except (discord.NotFound, discord.HTTPException):
+            existing = None
+
+    if existing:
+        await existing.edit(embed=design_embed(), view=PurchaseView())
+        message = existing
+    else:
+        message = await channel.send(embed=design_embed(), view=PurchaseView())
+
+    config["panel_message_id"] = message.id
+    config["panel_channel_id"] = channel.id
+    save_json(CONFIG_FILE, config)
+    return message
+
+
+# ============================================================
+# 管理者専用メッセージ送信
+# ============================================================
+
+class AdminMessageModal(discord.ui.Modal, title="管理者メッセージ送信"):
+    content = discord.ui.TextInput(
+        label="本文",
+        placeholder="ボットに送信させたい文章を入力",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
+    title_text = discord.ui.TextInput(label="Embedタイトル（任意）", required=False, max_length=256)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        channel = interaction.channel
+        content = str(self.content.value).strip()
+        title = str(self.title_text.value).strip()
+        if title:
+            embed = discord.Embed(title=title, description=content, color=design_color())
+            embed.set_footer(text=config["design"].get("footer", BOT_NAME))
+            await channel.send(embed=embed)
+        else:
+            await channel.send(content)
+        await interaction.response.send_message("✅ ボットとしてメッセージを送信しました。", ephemeral=True)
+
+
+# ============================================================
+# 管理パネル
+# ============================================================
 
 class AdminPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def interaction_check(self, interaction):
+    @discord.ui.button(label="販売機を設置・更新", emoji="🚀", style=discord.ButtonStyle.success, custom_id="kira:admin:deploy", row=0)
+    async def deploy(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_admin(interaction.user):
-            await interaction.response.send_message("🔒 管理者専用です。", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="販売機を設置/更新", emoji="🛒", style=discord.ButtonStyle.primary, row=0, custom_id="kira:admin:deploy")
-    async def deploy(self, interaction, button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        ch = await find_purchase_channel(interaction.guild)
-        if not ch:
-            await interaction.followup.send(
-                "❌ `#購入` が見つかりません。先に #購入 チャンネルを作成してください。",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
+        message = await deploy_purchase_panel(interaction.guild)
+        await interaction.response.send_message(f"✅ 販売機を更新しました。\n{message.jump_url}", ephemeral=True)
 
-        perms = ch.permissions_for(interaction.guild.me)
-        if not (perms.view_channel and perms.send_messages and perms.embed_links):
-            await interaction.followup.send(
-                "❌ Botが #購入 に投稿できません。",
-                ephemeral=True,
-            )
+    @discord.ui.button(label="商品管理", emoji="🛍️", style=discord.ButtonStyle.primary, custom_id="kira:admin:products", row=0)
+    async def products(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
+        await interaction.response.send_message("🛍️ **商品管理**\n追加・編集・在庫変更・販売ON/OFF・削除・画像設定ができます。", view=ProductAdminView(), ephemeral=True)
 
-        banner = config["design"].get("banner_url", "")
-        content = banner if banner.startswith("http") else None
+    @discord.ui.button(label="デザイン", emoji="🎨", style=discord.ButtonStyle.primary, custom_id="kira:admin:design", row=0)
+    async def design(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.response.send_message("🎨 **販売機デザイン**", view=DesignView(), ephemeral=True)
 
-        existing = None
-        mid = int(config.get("panel_message_id", 0) or 0)
-        if mid:
-            try:
-                existing = await ch.fetch_message(mid)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                existing = None
+    @discord.ui.button(label="チャンネル設定", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="kira:admin:channels", row=1)
+    async def channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.response.send_message("⚙️ **チャンネル設定**", view=ChannelSettingsView(), ephemeral=True)
 
-        if existing:
-            await existing.edit(
-                content=content,
-                embed=design_embed(),
-                view=PurchaseView(),
-            )
-            msg = existing
-        else:
-            msg = await ch.send(
-                content=content,
-                embed=design_embed(),
-                view=PurchaseView(),
-            )
+    @discord.ui.button(label="メディア", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id="kira:admin:media", row=1)
+    async def media(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.response.send_message("🖼️ **メディア管理**", view=MediaView(), ephemeral=True)
 
-        config["panel_message_id"] = msg.id
-        config["panel_channel_id"] = ch.id
-        save_json(CONFIG_FILE, config)
-
-        await interaction.followup.send(
-            f"✅ {ch.mention} の販売機を設置/更新しました。",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="商品管理", emoji="📦", style=discord.ButtonStyle.secondary, row=0, custom_id="kira:admin:products")
-    async def product_manage(self, interaction, button):
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="📦 商品管理",
-                description="追加・編集・削除・在庫変更を選択してください。",
-                color=int(config["design"]["color"]),
-            ),
-            view=ProductAdminView(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="デザイン", emoji="🎨", style=discord.ButtonStyle.secondary, row=0, custom_id="kira:admin:design")
-    async def design(self, interaction, button):
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="🎨 デザイン設定",
-                description="販売機の見た目を変更できます。",
-                color=int(config["design"]["color"]),
-            ),
-            view=DesignView(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="チャンネル設定", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1, custom_id="kira:admin:channels")
-    async def channels(self, interaction, button):
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚙️ チャンネル設定",
-                description=(
-                    f"🛒 購入: {channel_mention(interaction.guild, config.get('purchase_channel_id'))}\n"
-                    f"📦 注文通知: {channel_mention(interaction.guild, config.get('order_channel_id'))}\n"
-                    f"💬 専用チャットカテゴリ: {category_mention(interaction.guild, config.get('ticket_category_id'))}\n"
-                    f"🎞️ メディア: {channel_mention(interaction.guild, config.get('media_channel_id'))}"
-                ),
-                color=int(config["design"]["color"]),
-            ),
-            view=ChannelSettingsView(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="メディア/GIF", emoji="🎞️", style=discord.ButtonStyle.secondary, row=1, custom_id="kira:admin:media")
-    async def media(self, interaction, button):
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="🎞️ メディア管理",
-                description=(
-                    "管理者専用メディアチャンネルにGIF/画像をドラッグ＆ドロップできます。\n\n"
-                    "Discordのメッセージに本物の背景画像を設定する機能はないため、"
-                    "バナー/GIF・商品画像・Embedを組み合わせて見た目を作ります。"
-                ),
-                color=int(config["design"]["color"]),
-            ),
-            view=MediaView(),
-            ephemeral=True,
-        )
+    @discord.ui.button(label="メッセージ送信", emoji="📨", style=discord.ButtonStyle.primary, custom_id="kira:admin:message", row=1)
+    async def message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.response.send_modal(AdminMessageModal())
 
 
 # ============================================================
-# パネル更新
-# ============================================================
-
-async def update_purchase_panel():
-    cid = int(config.get("panel_channel_id", 0) or config.get("purchase_channel_id", 0) or 0)
-    mid = int(config.get("panel_message_id", 0) or 0)
-    if not cid or not mid:
-        return False
-
-    try:
-        channel = bot.get_channel(cid) or await bot.fetch_channel(cid)
-        if not isinstance(channel, discord.TextChannel):
-            return False
-        message = await channel.fetch_message(mid)
-        banner = config["design"].get("banner_url", "")
-        content = banner if banner.startswith("http") else None
-        await message.edit(
-            content=content,
-            embed=design_embed(),
-            view=PurchaseView(),
-        )
-        return True
-    except Exception as e:
-        print(f"[PANEL] 更新失敗: {e}")
-        return False
-
-
-# ============================================================
-# Bot / Events
+# Bot
 # ============================================================
 
 class KiraBot(commands.Bot):
     async def setup_hook(self):
-        # 現在のパネル用View
         self.add_view(PurchaseView())
         self.add_view(AdminPanelView())
-
-        # 古い販売パネルの購入ボタンを再起動後も処理
-        try:
-            self.add_dynamic_items(ProductPersistentButton)
-        except Exception as e:
-            print(f"[STARTUP] ProductPersistentButton登録失敗: {e}")
-
-        for oid, order in orders.items():
-            try:
-                self.add_view(OrderAdminView(oid))
-                if order.get("ticket_channel_id"):
-                    self.add_view(TicketView(oid))
-            except Exception as e:
-                print(f"[STARTUP] 永続View登録失敗 #{oid}: {e}")
-
-        await self.add_cog(AdminCog(self))
+        self.add_dynamic_items(
+            ProductPersistentButton,
+            OrderPaidPersistentButton,
+            OrderCancelPersistentButton,
+            TicketArchivePersistentButton,
+            TicketDeletePersistentButton,
+        )
 
         try:
             synced = await self.tree.sync()
-            print(f"✅ スラッシュコマンドを {len(synced)} 個同期しました")
-        except Exception as e:
-            print(f"❌ コマンド同期失敗: {e}")
+            print(f"[INFO] Slash commands synced: {len(synced)}")
+        except Exception:
+            traceback.print_exc()
 
 
-bot = KiraBot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None,
-)
+# 永続ビューとして登録するための汎用ハンドラ群
+# 注文・チケットの個別IDは起動後にメッセージへ付いているため、
+# 古いメッセージを再起動後も操作できるよう on_interaction で補完する。
+
+bot = KiraBot(command_prefix="!", intents=intents, help_command=None)
 
 
 class AdminCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(
-        name="admin",
-        description="キラの自動販売機 管理パネル",
-    )
-    @app_commands.default_permissions(administrator=True)
-    async def admin(self, interaction):
+    @app_commands.command(name="admin", description="管理者専用の自動販売機管理パネルを表示")
+    async def admin(self, interaction: discord.Interaction):
         if not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "🔒 管理者専用です。",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="⚙️ キラの自動販売機 管理パネル",
+            description=(
+                "ここから販売機をまとめて管理できます。\n\n"
+                "🛍️ 商品追加・編集・在庫・販売状態\n"
+                "🖼️ 商品画像アップロード\n"
+                "🎨 購入者側のデザイン\n"
+                "📨 ボットによる管理者メッセージ送信\n"
+                "🚀 販売機の設置・更新"
+            ),
+            color=design_color(),
+        )
+        await interaction.response.send_message(embed=embed, view=AdminPanelView(), ephemeral=True)
+
+    @app_commands.command(name="setup_vending", description="購入チャンネルに販売機を設置・更新")
+    async def setup_vending(self, interaction: discord.Interaction):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        message = await deploy_purchase_panel(interaction.guild)
+        await interaction.followup.send(f"✅ 販売機を設置・更新しました。\n{message.jump_url}", ephemeral=True)
+
+    @app_commands.command(name="send_message", description="管理者専用：ボットとして文章を送信")
+    @app_commands.describe(message="送信する文章")
+    async def send_message(self, interaction: discord.Interaction, message: str):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        await interaction.channel.send(message)
+        await interaction.response.send_message("✅ 送信しました。", ephemeral=True)
+
+    @app_commands.command(name="product_add", description="管理者専用：商品を追加")
+    @app_commands.describe(
+        name="商品名",
+        price="価格",
+        stock="在庫数",
+        description="商品説明",
+        emoji="商品絵文字",
+        image="商品画像ファイル（任意）",
+    )
+    async def product_add(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        price: int,
+        stock: int,
+        description: str = "",
+        emoji: str = "🛍️",
+        image: Optional[discord.Attachment] = None,
+    ):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+            return
+        if price < 0 or stock < 0:
+            await interaction.response.send_message("❌ 価格と在庫数は0以上で指定してください。", ephemeral=True)
+            return
+        if image and not image.content_type:
+            await interaction.response.send_message("❌ 画像ファイルを指定してください。", ephemeral=True)
+            return
+        if image and not str(image.content_type).startswith("image/"):
+            await interaction.response.send_message("❌ 商品画像には画像ファイルを指定してください。", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title="⚙️ キラの自動販売機 — 管理パネル",
-            description=(
-                "ここから販売機・商品・デザイン・メディア・チャンネルを管理できます。\n\n"
-                "🔒 この画面は管理者にだけ表示されます。"
-            ),
-            color=int(config["design"]["color"]),
-        )
+        pid = unique_product_id(name)
+        image_url = image.url if image else ""
+        products[pid] = {
+            "id": pid,
+            "name": name.strip()[:80],
+            "description": description.strip()[:1000],
+            "price": price,
+            "stock": stock,
+            "active": True,
+            "image_url": image_url,
+            "emoji": emoji.strip()[:20] or "🛍️",
+        }
+        save_json(PRODUCTS_FILE, products)
+        await update_purchase_panel()
         await interaction.response.send_message(
-            embed=embed,
-            view=AdminPanelView(),
+            f"✅ 商品を追加しました！\n"
+            f"**{products[pid]['name']}** / {money(price)} / 在庫 {stock}"
+            + ("\n🖼️ 商品画像も設定しました。" if image_url else ""),
             ephemeral=True,
         )
 
-    @app_commands.command(
-        name="setup_vending",
-        description="販売機の初期セットアップ",
-    )
-    @app_commands.default_permissions(administrator=True)
-    async def setup_vending(self, interaction):
+    @product_image.autocomplete("product")
+    async def product_image_autocomplete(self, interaction: discord.Interaction, current: str):
         if not is_admin(interaction.user):
-            await interaction.response.send_message(
-                "🔒 管理者専用です。",
-                ephemeral=True,
-            )
+            return []
+        current = current.lower().strip()
+        results = []
+        for pid, p in products.items():
+            name = str(p.get("name", pid))
+            if current in pid.lower() or current in name.lower():
+                results.append(app_commands.Choice(name=f"{name} [{pid}]"[:100], value=pid))
+            if len(results) >= 25:
+                break
+        return results
+
+    @app_commands.command(name="product_image", description="管理者専用：PCから商品画像を直接アップロードして設定")
+    @app_commands.describe(product="商品ID", image="設定する画像ファイル")
+    async def product_image(self, interaction: discord.Interaction, product: str, image: discord.Attachment):
+        if not is_admin(interaction.user):
+            await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild = interaction.guild
-
-        try:
-            if not config.get("guild_id"):
-                config["guild_id"] = guild.id
-                save_json(CONFIG_FILE, config)
-
-            order_channel = await get_or_create_order_channel(guild)
-            ticket_category = await get_or_create_ticket_category(guild)
-            purchase = await find_purchase_channel(guild)
-
-            await interaction.followup.send(
-                "✅ 初期セットアップ完了\n\n"
-                f"📦 注文通知: {order_channel.mention}\n"
-                f"💬 専用チャットカテゴリ: `{ticket_category.name}`\n"
-                f"🛒 購入チャンネル: {purchase.mention if purchase else '未設定'}\n\n"
-                "管理画面の `販売機を設置/更新` から販売機を設置してください。",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.followup.send(
-                f"❌ セットアップ失敗: `{e}`",
-                ephemeral=True,
-            )
+        target = find_product(product)
+        if not target:
+            await interaction.response.send_message("❌ 指定された商品IDが見つかりません。商品IDは商品JSONまたは追加時のIDを確認してください。", ephemeral=True)
+            return
+        if not image.content_type or not str(image.content_type).startswith("image/"):
+            await interaction.response.send_message("❌ 画像ファイルを指定してください。", ephemeral=True)
+            return
+        target["image_url"] = image.url
+        save_json(PRODUCTS_FILE, products)
+        await update_purchase_panel()
+        await interaction.response.send_message(f"🖼️ **{target.get('name', product)}** の画像を設定しました。", ephemeral=True)
 
 
 @bot.event
 async def on_ready():
-    print("=" * 55)
-    print(f"✅ ログインしました: {bot.user}")
-    print("🛒 キラの自動販売機 起動完了")
-    print("=" * 55)
-
-    if config.get("guild_id"):
-        guild = bot.get_guild(int(config["guild_id"]))
+    print(f"[READY] {bot.user} / {BOT_NAME}")
+    guild_id = config.get("guild_id", 0)
+    if guild_id:
+        guild = bot.get_guild(int(guild_id))
         if guild:
             try:
                 await get_or_create_order_channel(guild)
-            except Exception as e:
-                print(f"[STARTUP] 注文通知チャンネル確認失敗: {e}")
+            except Exception:
+                traceback.print_exc()
 
 
 @bot.event
@@ -1987,53 +1491,38 @@ async def on_guild_join(guild):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild:
+    if message.author.bot:
         return
 
-    media_id = int(config.get("media_channel_id", 0) or 0)
-    if media_id and message.channel.id == media_id and is_admin(message.author):
+    media_channel_id = config.get("media_channel_id", 0)
+    if media_channel_id and message.channel.id == int(media_channel_id) and message.attachments and is_admin(message.author):
         library = config.setdefault("media_library", [])
-        changed = False
-
         for attachment in message.attachments:
-            filename = attachment.filename.lower()
-            is_image = bool(
-                (attachment.content_type and attachment.content_type.startswith("image/"))
-                or filename.endswith((".gif", ".png", ".jpg", ".jpeg", ".webp"))
-            )
-            if not is_image:
-                continue
-
-            # 同じURLは重複登録しない。
-            if not any(item.get("url") == attachment.url for item in library):
-                library.insert(
-                    0,
-                    {
-                        "name": attachment.filename,
-                        "url": attachment.url,
-                        "type": attachment.content_type or "image",
-                        "created_at": now_iso(),
-                    },
-                )
-                changed = True
-
-        if changed:
-            del library[50:]
-            save_json(CONFIG_FILE, config)
-            print(f"[MEDIA] {message.author} の画像/GIFを保存しました。")
+            if attachment.content_type and str(attachment.content_type).startswith("image/"):
+                library.append({
+                    "name": attachment.filename,
+                    "url": attachment.url,
+                    "uploaded_by": message.author.id,
+                    "created_at": now_iso(),
+                })
+        config["media_library"] = library[-50:]
+        save_json(CONFIG_FILE, config)
 
     await bot.process_commands(message)
 
 
 @bot.event
 async def on_error(event, *args, **kwargs):
-    import traceback
-    print(f"[BOT ERROR] event={event}")
     traceback.print_exc()
 
 
-if __name__ == "__main__":
+async def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("DISCORD_TOKEN が設定されていません。")
-    bot.run(token)
+        raise RuntimeError("DISCORD_TOKEN が環境変数に設定されていません。")
+    await bot.add_cog(AdminCog(bot))
+    await bot.start(token)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
