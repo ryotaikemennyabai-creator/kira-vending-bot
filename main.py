@@ -214,8 +214,31 @@ def design_color():
         return discord.Color.blurple()
 
 
+def safe_stock(product):
+    try:
+        return max(0, int(product.get("stock", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def safe_product_name(product):
+    value = product.get("name", "商品")
+    return str(value).strip() or "商品"
+
+
+def safe_product_description(product):
+    value = product.get("description", "説明はありません。")
+    text = str(value) if value is not None else "説明はありません。"
+    return text[:4096] if text.strip() else "説明はありません。"
+
+
+def safe_product_emoji(product):
+    value = product.get("emoji")
+    return str(value).strip()[:20] if value else "🛍️"
+
+
 def stock_text(product):
-    stock = int(product.get("stock", 0))
+    stock = safe_stock(product)
     if stock <= 0:
         return "🔴 売り切れ"
     if stock <= 3:
@@ -224,8 +247,8 @@ def stock_text(product):
 
 
 def product_line(product):
-    emoji = product.get("emoji") or "🛍️"
-    name = str(product.get("name", "商品"))
+    emoji = safe_product_emoji(product)
+    name = safe_product_name(product)
     price = money(product.get("price", 0))
     if config["design"].get("show_stock", True):
         return f"{emoji} **{name}**　`{price}`　{stock_text(product)}"
@@ -275,15 +298,21 @@ def design_embed():
 
 
 def product_embed(product):
+    emoji = safe_product_emoji(product)
+    name = safe_product_name(product)
+    description = safe_product_description(product)
     embed = discord.Embed(
-        title=f"{product.get('emoji', '🛍️')} {product.get('name', '商品')}",
-        description=product.get("description", "説明はありません。"),
+        title=f"{emoji} {name}"[:256],
+        description=description,
         color=design_color(),
     )
     embed.add_field(name="💰 価格", value=f"**{money(product.get('price', 0))}**", inline=True)
     embed.add_field(name="📦 在庫", value=stock_text(product), inline=True)
-    if product.get("image_url"):
-        embed.set_thumbnail(url=product["image_url"])
+
+    image_url = str(product.get("image_url") or "").strip()
+    if re.match(r"^https?://[^\s]+$", image_url, re.IGNORECASE):
+        embed.set_thumbnail(url=image_url[:500])
+
     embed.set_footer(text="購入内容をご確認のうえ「購入する」を押してください。")
     return embed
 
@@ -486,10 +515,10 @@ class TicketDeletePersistentButton(discord.ui.DynamicItem[discord.ui.Button], te
 class ProductButton(discord.ui.Button):
     def __init__(self, product_id):
         product = find_product(product_id) or {}
-        sold_out = int(product.get("stock", 0)) <= 0
+        sold_out = safe_stock(product) <= 0
         super().__init__(
-            label=(str(product.get("name", "商品"))[:80]),
-            emoji=product.get("emoji") or "🛍️",
+            label=safe_product_name(product)[:80],
+            emoji=safe_product_emoji(product),
             style=discord.ButtonStyle.secondary if not sold_out else discord.ButtonStyle.danger,
             custom_id=f"kira:buy:{product_id}",
             disabled=sold_out,
@@ -498,28 +527,37 @@ class ProductButton(discord.ui.Button):
         self.product_id = product_id
 
     async def callback(self, interaction: discord.Interaction):
-        # ボタン押下から3秒以内に必ずACKしてから処理する。
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             product = find_product(self.product_id)
             if not product or not product.get("active", True):
-                await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
+                await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
                 return
-            if int(product.get("stock", 0)) <= 0:
-                await interaction.followup.send("❌ この商品は売り切れです。", ephemeral=True)
+            if safe_stock(product) <= 0:
+                await interaction.response.send_message("❌ この商品は売り切れです。", ephemeral=True)
                 return
 
-            await interaction.followup.send(
-                embed=product_embed(product),
-                view=ProductDetailView(self.product_id),
+            embed = product_embed(product)
+            view = ProductDetailView(self.product_id)
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
                 ephemeral=True,
             )
         except Exception:
             traceback.print_exc()
-            await interaction.followup.send(
-                "❌ 商品画面の表示中にエラーが発生しました。管理者に確認してください。",
-                ephemeral=True,
-            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "❌ 商品画面の表示中にエラーが発生しました。管理者に確認してください。",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "❌ 商品画面の表示中にエラーが発生しました。管理者に確認してください。",
+                        ephemeral=True,
+                    )
+            except Exception:
+                traceback.print_exc()
 
 
 class ProductDetailView(discord.ui.View):
