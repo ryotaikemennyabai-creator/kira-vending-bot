@@ -419,7 +419,7 @@ class PurchaseView(discord.ui.View):
 class ProductPersistentButton(discord.ui.DynamicItem[discord.ui.Button], template=r"kira:buy:(?P<pid>[A-Za-z0-9_-]{1,64})"):
     async def callback(self, interaction: discord.Interaction):
         # 念のため残してある互換用ハンドラ。現在の購入パネルはPurchaseViewで処理する。
-        await interaction.response.defer(ephemeral=True, thinking=False)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             product_id = self.item.custom_id.split(":", 2)[-1]
             product = find_product(product_id)
@@ -499,7 +499,7 @@ class ProductButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         # ボタン押下から3秒以内に必ずACKしてから処理する。
-        await interaction.response.defer(ephemeral=True, thinking=False)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             product = find_product(self.product_id)
             if not product or not product.get("active", True):
