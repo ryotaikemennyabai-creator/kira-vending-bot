@@ -531,107 +531,82 @@ class PayPayModal(discord.ui.Modal, title="PayPayで購入"):
         self.product_id = product_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Modal送信直後にDiscordへ応答を確保する。
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         url = str(self.paypay_url.value).strip()
         if not re.match(r"^https?://", url, re.IGNORECASE):
-            await interaction.response.send_message("❌ 有効なURLを入力してください。", ephemeral=True)
+            await interaction.followup.send("❌ 有効なURLを入力してください。", ephemeral=True)
             return
 
-        # Discordの3秒応答制限を先に確保してから、チャンネル作成・パネル更新などの時間がかかる処理を行う。
-        await interaction.response.defer(ephemeral=True)
-
-        async with purchase_lock:
-            product = find_product(self.product_id)
-            if not product or not product.get("active", True):
-                await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
-                return
-
-            stock = int(product.get("stock", 0))
-            if stock <= 0:
-                await interaction.followup.send("❌ 申し訳ありません。在庫切れになりました。", ephemeral=True)
-                return
-
-            product["stock"] = stock - 1
-            order_id = next_order_id()
-            order = {
-                "id": order_id,
-                "product_id": self.product_id,
-                "buyer_id": interaction.user.id,
-                "guild_id": interaction.guild_id,
-                "price": int(product.get("price", 0)),
-                "paypay_url": url,
-                "status": "pending",
-                "created_at": now_iso(),
-                "ticket_channel_id": 0,
-            }
-            orders[order_id] = order
-            save_json(PRODUCTS_FILE, products)
-            save_json(ORDERS_FILE, orders)
-
-        await update_purchase_panel()
-
-        ticket = None
         try:
-            ticket = await create_ticket(order, interaction.guild, interaction.user)
-        except Exception:
-            traceback.print_exc()
+            async with purchase_lock:
+                product = find_product(self.product_id)
+                if not product or not product.get("active", True):
+                    await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
+                    return
 
-        try:
-            order_channel = await get_or_create_order_channel(interaction.guild)
-            await order_channel.send(embed=order_embed(order), view=OrderAdminView(order_id))
-        except Exception:
-            traceback.print_exc()
+                stock = int(product.get("stock", 0))
+                if stock <= 0:
+                    await interaction.followup.send("❌ 申し訳ありません。在庫切れになりました。", ephemeral=True)
+                    return
 
-        try:
-            await interaction.user.send(
-                f"🧾 **{order_id}** の注文を受け付けました。\n"
-                f"商品: **{product.get('name', '商品')}**\n"
-                f"金額: **{money(product.get('price', 0))}**\n"
-                f"状態: **支払い確認待ち**"
+                product["stock"] = stock - 1
+                order_id = next_order_id()
+                order = {
+                    "id": order_id,
+                    "product_id": self.product_id,
+                    "buyer_id": interaction.user.id,
+                    "guild_id": interaction.guild_id,
+                    "price": int(product.get("price", 0)),
+                    "paypay_url": url,
+                    "status": "pending",
+                    "created_at": now_iso(),
+                    "ticket_channel_id": 0,
+                }
+                orders[order_id] = order
+                save_json(PRODUCTS_FILE, products)
+                save_json(ORDERS_FILE, orders)
+
+            await update_purchase_panel()
+
+            try:
+                await create_ticket(order, interaction.guild, interaction.user)
+            except Exception:
+                traceback.print_exc()
+
+            try:
+                order_channel = await get_or_create_order_channel(interaction.guild)
+                await order_channel.send(embed=order_embed(order), view=OrderAdminView(order_id))
+            except Exception:
+                traceback.print_exc()
+
+            try:
+                await interaction.user.send(
+                    f"🧾 **{order_id}** の注文を受け付けました。\n"
+                    f"商品: **{product.get('name', '商品')}**\n"
+                    f"金額: **{money(product.get('price', 0))}**\n"
+                    f"状態: **支払い確認待ち**"
+                )
+            except Exception:
+                traceback.print_exc()
+
+            await interaction.followup.send(
+                f"✅ **購入受付完了！**\n\n"
+                f"🧾 注文番号: **{order_id}**\n"
+                f"🛍️ 商品: **{product.get('name', '商品')}**\n"
+                f"💴 金額: **{money(product.get('price', 0))}**\n\n"
+                "📩 購入チャットを作成しました。\n"
+                "管理者の支払い確認をお待ちください。",
+                ephemeral=True,
             )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
 
-        message = f"✅ 購入受付完了！\n注文番号: **{order_id}**"
-        if ticket:
-            message += f"\n専用チャット: {ticket.mention}"
-        else:
-            message += "\n⚠️ 専用チャットの作成に失敗したため、管理者へご連絡ください。"
-
-        await interaction.followup.send(message, ephemeral=True)
-
-
-# ============================================================
-# 注文管理
-# ============================================================
-
-class ProcessedOrderView(discord.ui.View):
-    """支払い確認・キャンセル後に表示する固定ビュー。"""
-    def __init__(self):
-        super().__init__(timeout=None)
-
-
-async def process_paid_order(interaction, order_id):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
-        return
-    order = orders.get(order_id)
-    if not order:
-        await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
-        return
-    if order.get("status") == "cancelled":
-        await interaction.response.send_message("❌ キャンセル済み注文です。", ephemeral=True)
-        return
-    # 以降の保存・DM処理に時間がかかっても3秒制限にかからないよう先にACKする。
-    await interaction.response.defer()
-    order["status"] = "paid"
-    order["paid_at"] = now_iso()
-    save_json(ORDERS_FILE, orders)
-    await interaction.edit_original_response(embed=order_embed(order), view=ProcessedOrderView())
-    try:
-        user = interaction.guild.get_member(int(order["buyer_id"])) or await interaction.guild.fetch_member(int(order["buyer_id"]))
-        await user.send(f"🟢 注文 **{order_id}** の支払い確認が完了しました！")
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError):
-        pass
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send(
+                "❌ 購入処理中にエラーが発生しました。管理者に確認してください。",
+                ephemeral=True,
+            )
 
 
 class OrderPaidButton(discord.ui.Button):
