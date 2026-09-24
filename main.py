@@ -536,15 +536,18 @@ class PayPayModal(discord.ui.Modal, title="PayPayで購入"):
             await interaction.response.send_message("❌ 有効なURLを入力してください。", ephemeral=True)
             return
 
+        # Discordの3秒応答制限を先に確保してから、チャンネル作成・パネル更新などの時間がかかる処理を行う。
+        await interaction.response.defer(ephemeral=True)
+
         async with purchase_lock:
             product = find_product(self.product_id)
             if not product or not product.get("active", True):
-                await interaction.response.send_message("❌ この商品は現在販売されていません。", ephemeral=True)
+                await interaction.followup.send("❌ この商品は現在販売されていません。", ephemeral=True)
                 return
 
             stock = int(product.get("stock", 0))
             if stock <= 0:
-                await interaction.response.send_message("❌ 申し訳ありません。在庫切れになりました。", ephemeral=True)
+                await interaction.followup.send("❌ 申し訳ありません。在庫切れになりました。", ephemeral=True)
                 return
 
             product["stock"] = stock - 1
@@ -594,7 +597,7 @@ class PayPayModal(discord.ui.Modal, title="PayPayで購入"):
         else:
             message += "\n⚠️ 専用チャットの作成に失敗したため、管理者へご連絡ください。"
 
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction.followup.send(message, ephemeral=True)
 
 
 # ============================================================
@@ -618,10 +621,12 @@ async def process_paid_order(interaction, order_id):
     if order.get("status") == "cancelled":
         await interaction.response.send_message("❌ キャンセル済み注文です。", ephemeral=True)
         return
+    # 以降の保存・DM処理に時間がかかっても3秒制限にかからないよう先にACKする。
+    await interaction.response.defer()
     order["status"] = "paid"
     order["paid_at"] = now_iso()
     save_json(ORDERS_FILE, orders)
-    await interaction.response.edit_message(embed=order_embed(order), view=ProcessedOrderView())
+    await interaction.edit_original_response(embed=order_embed(order), view=ProcessedOrderView())
     try:
         user = interaction.guild.get_member(int(order["buyer_id"])) or await interaction.guild.fetch_member(int(order["buyer_id"]))
         await user.send(f"🟢 注文 **{order_id}** の支払い確認が完了しました！")
@@ -652,6 +657,8 @@ async def process_cancel_order(interaction, order_id):
     if order.get("status") == "paid":
         await interaction.response.send_message("❌ 支払い確認済みの注文はこのボタンからキャンセルできません。", ephemeral=True)
         return
+    # パネル更新などの非同期処理前にACKする。
+    await interaction.response.defer()
     product = find_product(order.get("product_id"))
     if product:
         product["stock"] = int(product.get("stock", 0)) + 1
@@ -660,7 +667,7 @@ async def process_cancel_order(interaction, order_id):
     order["cancelled_at"] = now_iso()
     save_json(ORDERS_FILE, orders)
     await update_purchase_panel()
-    await interaction.response.edit_message(embed=order_embed(order), view=ProcessedOrderView())
+    await interaction.edit_original_response(embed=order_embed(order), view=ProcessedOrderView())
     try:
         user = interaction.guild.get_member(int(order["buyer_id"])) or await interaction.guild.fetch_member(int(order["buyer_id"]))
         await user.send(f"🔴 注文 **{order_id}** はキャンセルされました。")
@@ -764,8 +771,9 @@ class ProductModal(discord.ui.Modal, title="商品を追加"):
             "emoji": str(self.emoji.value).strip() or "🛍️",
         }
         save_json(PRODUCTS_FILE, products)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ 商品を追加しました。\n**{products[pid]['name']}** / {money(price)} / 在庫 {stock}\n\n📷 商品画像を付けたい場合は、管理パネルの **「画像を設定」** または `/product_image` を使えます。",
             ephemeral=True,
         )
@@ -806,8 +814,9 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
         product["description"] = str(self.description.value).strip()
         product["emoji"] = str(self.emoji.value).strip() or "🛍️"
         save_json(PRODUCTS_FILE, products)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ 商品情報を更新しました。", ephemeral=True)
+        await interaction.followup.send("✅ 商品情報を更新しました。", ephemeral=True)
 
 
 class StockModal(discord.ui.Modal, title="在庫を変更"):
@@ -836,8 +845,9 @@ class StockModal(discord.ui.Modal, title="在庫を変更"):
             return
         product["stock"] = stock
         save_json(PRODUCTS_FILE, products)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message(f"✅ 在庫を **{stock}個** に変更しました。", ephemeral=True)
+        await interaction.followup.send(f"✅ 在庫を **{stock}個** に変更しました。", ephemeral=True)
 
 
 class ProductSelect(discord.ui.Select):
@@ -877,14 +887,16 @@ class ProductSelect(discord.ui.Select):
         elif self.action == "delete":
             del products[pid]
             save_json(PRODUCTS_FILE, products)
+            await interaction.response.defer(ephemeral=True)
             await update_purchase_panel()
-            await interaction.response.send_message(f"🗑️ **{product.get('name')}** を削除しました。", ephemeral=True)
+            await interaction.followup.send(f"🗑️ **{product.get('name')}** を削除しました。", ephemeral=True)
         elif self.action == "toggle":
             product["active"] = not bool(product.get("active", True))
             save_json(PRODUCTS_FILE, products)
+            await interaction.response.defer(ephemeral=True)
             await update_purchase_panel()
             state = "販売中" if product["active"] else "非公開"
-            await interaction.response.send_message(f"✅ **{product.get('name')}** を **{state}** にしました。", ephemeral=True)
+            await interaction.followup.send(f"✅ **{product.get('name')}** を **{state}** にしました。", ephemeral=True)
 
 
 class ProductSelectView(discord.ui.View):
@@ -923,7 +935,7 @@ class ProductAdminView(discord.ui.View):
     @discord.ui.button(label="画像を設定", emoji="🖼️", style=discord.ButtonStyle.primary, row=1)
     async def image(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "📷 商品画像を設定するには **/product_image** を使用してください。\n画像ファイルをそのコマンドの添付欄から直接アップロードできます。",
+            "📷 **画像を直接アップロードできます！**\n\n`/product_image` を入力 → 商品を選択 → **image欄にPCから画像を添付**してください。\n※Discordの仕様上、通常のModal（商品追加画面）にはファイル添付欄を表示できません。",
             ephemeral=True,
         )
 
@@ -958,8 +970,9 @@ class DesignTextModal(discord.ui.Modal, title="販売機の文章を編集"):
         d["notice"] = str(self.notice.value).strip()
         d["footer"] = str(self.footer.value).strip()
         save_json(CONFIG_FILE, config)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ 販売機の文章を更新しました。", ephemeral=True)
+        await interaction.followup.send("✅ 販売機の文章を更新しました。", ephemeral=True)
 
 
 class ColorModal(discord.ui.Modal, title="色を変更"):
@@ -975,8 +988,9 @@ class ColorModal(discord.ui.Modal, title="色を変更"):
             return
         config["design"]["color"] = int(raw, 16)
         save_json(CONFIG_FILE, config)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ 色を変更しました。", ephemeral=True)
+        await interaction.followup.send("✅ 色を変更しました。", ephemeral=True)
 
 
 class BannerModal(discord.ui.Modal, title="バナーURLを変更"):
@@ -992,8 +1006,9 @@ class BannerModal(discord.ui.Modal, title="バナーURLを変更"):
             return
         config["design"]["banner_url"] = url
         save_json(CONFIG_FILE, config)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message("✅ バナーを更新しました。", ephemeral=True)
+        await interaction.followup.send("✅ バナーを更新しました。", ephemeral=True)
 
 
 class DesignPresetView(discord.ui.View):
@@ -1428,11 +1443,12 @@ class AdminCog(commands.Cog):
             "emoji": emoji.strip()[:20] or "🛍️",
         }
         save_json(PRODUCTS_FILE, products)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ 商品を追加しました！\n"
             f"**{products[pid]['name']}** / {money(price)} / 在庫 {stock}"
-            + ("\n🖼️ 商品画像も設定しました。" if image_url else ""),
+            + ("\n🖼️ 商品画像も設定しました。" if image_url else "\n📷 画像は `/product_image` から後から直接アップロードできます。"),
             ephemeral=True,
         )
 
@@ -1451,8 +1467,9 @@ class AdminCog(commands.Cog):
             return
         target["image_url"] = image.url
         save_json(PRODUCTS_FILE, products)
+        await interaction.response.defer(ephemeral=True)
         await update_purchase_panel()
-        await interaction.response.send_message(f"🖼️ **{target.get('name', product)}** の画像を設定しました。", ephemeral=True)
+        await interaction.followup.send(f"🖼️ **{target.get('name', product)}** の画像を設定しました。", ephemeral=True)
 
     @product_image.autocomplete("product")
     async def product_image_autocomplete(self, interaction: discord.Interaction, current: str):
