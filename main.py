@@ -960,7 +960,10 @@ async def create_ticket(
         )
     )
 
-    return channelasync def ensure_order_channel(
+    return channel
+
+
+async def ensure_order_channel(
     guild
 ):
 
