@@ -631,7 +631,7 @@ class ProductDetailView(discord.ui.View):
             return
         await interaction.response.send_modal(PayPayModal(self.product_id))
 
-    @discord.ui.button(label="閉じる", emoji="✕", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="閉じる", style=discord.ButtonStyle.secondary)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="この購入画面を閉じました。", embed=None, view=None)
 
