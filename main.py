@@ -1536,8 +1536,7 @@ async def on_error(event, *args, **kwargs):
 async def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        import getpass
-        token = getpass.getpass("Discord Bot Token: ").strip()
+        token = input("Discord Bot Token: ").strip()
     if not token:
         raise RuntimeError("Discord Bot Token が入力されていません。")
     await bot.add_cog(AdminCog(bot))
