@@ -1509,11 +1509,9 @@ async def on_error(event, *args, **kwargs):
 
 
 async def main():
-    token = os.getenv("DISCORD_TOKEN")
+    token = os.getenv("DORD_TOKEN")
     if not token:
-        token = input("Discord Bot Token: ").strip()
-    if not token:
-        raise RuntimeError("Discord Bot Token が入力されていません。")
+        raise RuntimeError("DORD_TOKEN が環境変数に設定されていません。")
     await bot.add_cog(AdminCog(bot))
     await bot.start(token)
 
