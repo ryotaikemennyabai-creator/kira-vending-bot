@@ -274,16 +274,64 @@ def design_embed():
     return embed
 
 
+def _safe_product_display(product):
+    """購入画面へ渡す値をDiscordの文字列/URLとして安全な形にする。"""
+    raw_name = product.get("name", "商品")
+    raw_description = product.get("description", "説明はありません。")
+    raw_emoji = product.get("emoji", "🛍️")
+    raw_image = product.get("image_url", "")
+
+    name = str(raw_name if raw_name is not None else "商品").strip() or "商品"
+    description = str(raw_description if raw_description is not None else "説明はありません。").strip()
+    emoji = str(raw_emoji if raw_emoji is not None else "🛍️").strip() or "🛍️"
+    image_url = str(raw_image if raw_image is not None else "").strip()
+
+    # DiscordのEmbed上限を超えないようにする。
+    name = name[:240]
+    description = description[:4096] or "説明はありません。"
+    emoji = emoji[:32]
+
+    # 画像URLはHTTP(S)だけを許可。壊れた値は画像なしで表示する。
+    if not re.match(r"^https?://[^\s]+$", image_url, re.IGNORECASE):
+        image_url = ""
+    else:
+        image_url = image_url[:2000]
+
+    try:
+        price = int(product.get("price", 0))
+    except (TypeError, ValueError):
+        price = 0
+
+    try:
+        stock = int(product.get("stock", 0))
+    except (TypeError, ValueError):
+        stock = 0
+
+    return {
+        "name": name,
+        "description": description,
+        "emoji": emoji,
+        "image_url": image_url,
+        "price": price,
+        "stock": stock,
+    }
+
+
 def product_embed(product):
+    safe = _safe_product_display(product)
     embed = discord.Embed(
-        title=f"{product.get('emoji', '🛍️')} {product.get('name', '商品')}",
-        description=product.get("description", "説明はありません。"),
+        title=f"{safe['emoji']} {safe['name']}",
+        description=safe["description"],
         color=design_color(),
     )
-    embed.add_field(name="💰 価格", value=f"**{money(product.get('price', 0))}**", inline=True)
-    embed.add_field(name="📦 在庫", value=stock_text(product), inline=True)
-    if product.get("image_url"):
-        embed.set_thumbnail(url=product["image_url"])
+    embed.add_field(name="💰 価格", value=f"**{money(safe['price'])}**", inline=True)
+    embed.add_field(
+        name="📦 在庫",
+        value=stock_text({"stock": safe["stock"]}),
+        inline=True,
+    )
+    if safe["image_url"]:
+        embed.set_thumbnail(url=safe["image_url"])
     embed.set_footer(text="購入内容をご確認のうえ「購入する」を押してください。")
     return embed
 
@@ -498,11 +546,17 @@ class ProductButton(discord.ui.Button):
         self.product_id = product_id
 
     async def callback(self, interaction: discord.Interaction):
-        # 商品画面は先にInteractionをACKしてからfollowupで表示する。
-        # 購入ボタンの押下直後に応答を確保することで、初回responseの失敗を防ぐ。
+        # 商品画面はまずACKし、その後に商品内容を表示する。
+        # 商品データに壊れた値があっても購入画面自体が落ちないようにする。
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception:
+            # すでにACK済みの場合はこの後のfollowupを試す。
+            if not interaction.response.is_done():
+                traceback.print_exc()
+                return
 
+        try:
             product = find_product(self.product_id)
             if not product or not product.get("active", True):
                 await interaction.followup.send(
@@ -511,20 +565,45 @@ class ProductButton(discord.ui.Button):
                 )
                 return
 
-            if int(product.get("stock", 0)) <= 0:
+            try:
+                stock = int(product.get("stock", 0))
+            except (TypeError, ValueError):
+                stock = 0
+
+            if stock <= 0:
                 await interaction.followup.send(
                     "❌ この商品は売り切れです。",
                     ephemeral=True,
                 )
                 return
 
-            embed = product_embed(product)
             view = ProductDetailView(self.product_id)
-            await interaction.followup.send(
-                embed=embed,
-                view=view,
-                ephemeral=True,
-            )
+
+            try:
+                # 通常は見た目の良いEmbed版を送る。
+                embed = product_embed(product)
+                await interaction.followup.send(
+                    embed=embed,
+                    view=view,
+                    ephemeral=True,
+                )
+            except Exception:
+                # Embed/画像データだけが原因なら、同じ購入ボタン付きの
+                # プレーンテキスト画面へ安全にフォールバックする。
+                traceback.print_exc()
+                safe = _safe_product_display(product)
+                await interaction.followup.send(
+                    content=(
+                        f"{safe['emoji']} **{safe['name']}**\n\n"
+                        f"{safe['description']}\n\n"
+                        f"💰 価格: **{money(safe['price'])}**\n"
+                        f"📦 在庫: **{safe['stock']}個**\n\n"
+                        "購入内容をご確認のうえ「購入する」を押してください。"
+                    ),
+                    view=view,
+                    ephemeral=True,
+                )
+
         except Exception:
             traceback.print_exc()
             try:
