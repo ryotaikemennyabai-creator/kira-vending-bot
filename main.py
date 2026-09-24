@@ -2102,7 +2102,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.autocomplete("vending")
+    @product_add.autocomplete("vending")
     async def product_add_vending_autocomplete(self, interaction, current: str):
         current = current.lower().strip()
         results = []
