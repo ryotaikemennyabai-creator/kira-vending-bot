@@ -1120,7 +1120,7 @@ class PurchaseView(discord.ui.View):
 
 class CategorySelect(discord.ui.Select):
     def __init__(self, machine_id: str, category: str, options: list[discord.SelectOption]):
-        super().__init__(placeholder="カテゴリーを選択", options=options, min_values=1, max_values=1, row=0)
+        super().__init__(placeholder="カテゴリーを選択", options=options, min_values=1, max_values=1, custom_id=f"kira:category:{machine_id}", row=0)
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
