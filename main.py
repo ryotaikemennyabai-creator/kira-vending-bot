@@ -16,6 +16,7 @@ DEFAULT_DESIGN: Dict[str, Any] = {
     "title": "キラの自動販売機",
     "subtitle": "安全・簡単・スピーディー",
     "description": "商品を選択して購入してください。",
+    "details": "安全・簡単・スピーディーにご利用いただけます。\n\n購入前に商品内容・価格・在庫をご確認ください。",
     "notice": "お支払いはPayPayに対応しています。",
     "footer": "キラの自動販売機",
     "color": "purple",
@@ -136,7 +137,8 @@ def normalize_design(design: Any, machine_name: str = "メイン自販機") -> D
     result["title"] = str(result.get("title") or machine_name)[:256]
     result["subtitle"] = str(result.get("subtitle") or "")[:256]
     result["description"] = str(result.get("description") or "")[:4000]
-    result["notice"] = str(result.get("notice") or "")[:4000]
+    result["details"] = str(result.get("details") or "")[:3000]
+    result["notice"] = str(result.get("notice") or "")[:3000]
     result["footer"] = str(result.get("footer") or "")[:256]
     result["banner_url"] = str(result.get("banner_url") or "")[:2048]
     result["button_label"] = str(result.get("button_label") or "購入する")[:80]
@@ -927,14 +929,16 @@ def vending_embed(machine_id: str) -> discord.Embed:
         return discord.Embed(title=BOT_NAME, description="自販機が見つかりません")
     design = machine["design"]
     title = safe_text(design.get("title"), machine["name"])
-    description = safe_text(design.get("description"))
+    description = safe_text(design.get("description"))[:2800]
     embed = discord.Embed(title=title, description=description, color=design_color(machine))
     if design.get("subtitle"):
-        embed.add_field(name="✨", value=safe_text(design["subtitle"]), inline=False)
+        embed.add_field(name="✨", value=safe_text(design["subtitle"])[:1000], inline=False)
+    if design.get("details"):
+        embed.add_field(name="📖 詳細案内", value=safe_text(design["details"])[:1800], inline=False)
     if design.get("news"):
-        embed.add_field(name="📢 お知らせ", value=safe_text(design["news"]), inline=False)
+        embed.add_field(name="📢 お知らせ", value=safe_text(design["news"])[:900], inline=False)
     if design.get("notice"):
-        embed.add_field(name="⚠️ ご案内", value=safe_text(design["notice"]), inline=False)
+        embed.add_field(name="⚠️ ご案内", value=safe_text(design["notice"])[:1000], inline=False)
     status = "🔴 メンテナンス中" if design.get("maintenance") else "🟢 営業中"
     embed.add_field(name="ステータス", value=status, inline=True)
     cats = product_categories(machine_id)
@@ -1946,7 +1950,7 @@ def product_detail_admin_embed(machine_id: str, product_id: str) -> discord.Embe
     embed.add_field(name="状態", value="販売中" if p["active"] else "停止", inline=True)
     embed.add_field(name="カテゴリー", value=p.get("category", "その他"), inline=True)
     embed.add_field(name="1日上限", value=str(p.get("purchase_limit", 0) or "無制限"), inline=True)
-    embed.add_field(name="画像", value="設定済み" if p.get("image_url") else "未設定", inline=True)
+    embed.add_field(name="画像", value="設定済み（添付）" if p.get("image_url") else "未設定", inline=True)
     return embed
 
 
@@ -1964,9 +1968,12 @@ class ProductEditView(discord.ui.View):
     async def stock(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(StockModal(self.machine_id, self.product_id))
 
-    @discord.ui.button(label="🖼️ 画像URL", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="📎 画像追加", style=discord.ButtonStyle.secondary, row=0)
     async def image(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ProductImageModal(self.machine_id, self.product_id))
+        await interaction.response.send_message(
+            f"📎 商品画像はURL入力ではなく、Discordの `/product_image` で画像ファイルをそのままドラッグ＆ドロップして設定できます。\n\n自販機: `{self.machine_id}`\n商品ID: `{self.product_id}`",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="🔄 販売ON/OFF", style=discord.ButtonStyle.secondary, row=1)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2102,7 +2109,8 @@ def design_embed(machine_id: str) -> discord.Embed:
     embed = discord.Embed(title=f"🎨 デザイン - {machine['name']}", color=design_color(machine))
     embed.add_field(name="タイトル", value=d.get("title", ""), inline=False)
     embed.add_field(name="サブタイトル", value=d.get("subtitle", "") or "なし", inline=False)
-    embed.add_field(name="説明", value=d.get("description", "")[:1000] or "なし", inline=False)
+    embed.add_field(name="説明", value=safe_text(d.get("description", ""))[:1000] or "なし", inline=False)
+    embed.add_field(name="詳細案内", value=safe_text(d.get("details", ""))[:1000] or "なし", inline=False)
     embed.add_field(name="色", value=d.get("color", "purple"), inline=True)
     embed.add_field(name="ボタン", value=d.get("button_style", "green"), inline=True)
     embed.add_field(name="バナー", value="設定済み" if d.get("banner_url") else "なし", inline=True)
@@ -2128,9 +2136,12 @@ class DesignView(discord.ui.View):
     async def button_color(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(embed=design_embed(self.machine_id), view=ButtonStyleView(self.machine_id))
 
-    @discord.ui.button(label="🖼️ バナー", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="📎 パネル写真", style=discord.ButtonStyle.secondary, row=1)
     async def banner(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BannerModal(self.machine_id))
+        await interaction.response.send_message(
+            f"📎 パネル写真は `/panel_photo` で画像ファイルをそのままドラッグ＆ドロップして設定できます。\n\n自販機: `{self.machine_id}`",
+            ephemeral=True
+        )
 
     @discord.ui.button(label="✨ プリセット", style=discord.ButtonStyle.success, row=1)
     async def preset(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2152,9 +2163,9 @@ class DesignView(discord.ui.View):
 class DesignTextModal(discord.ui.Modal, title="自販機テキスト"):
     title_text = discord.ui.TextInput(label="タイトル", max_length=256)
     subtitle = discord.ui.TextInput(label="サブタイトル", max_length=256, required=False)
-    description = discord.ui.TextInput(label="説明", style=discord.TextStyle.paragraph, max_length=2000, required=False)
-    notice = discord.ui.TextInput(label="注意文", style=discord.TextStyle.paragraph, max_length=2000, required=False)
-    footer = discord.ui.TextInput(label="フッター", max_length=256, required=False)
+    description = discord.ui.TextInput(label="説明", style=discord.TextStyle.paragraph, max_length=1800, required=False)
+    details = discord.ui.TextInput(label="詳しい説明・使い方", style=discord.TextStyle.paragraph, max_length=1800, required=False)
+    notice = discord.ui.TextInput(label="ご案内・注意文", style=discord.TextStyle.paragraph, max_length=1200, required=False)
 
     def __init__(self, machine_id: str):
         super().__init__()
@@ -2162,9 +2173,9 @@ class DesignTextModal(discord.ui.Modal, title="自販機テキスト"):
         d = get_machine(machine_id)["design"]
         self.title_text.default = d.get("title", "")
         self.subtitle.default = d.get("subtitle", "")
-        self.description.default = d.get("description", "")
-        self.notice.default = d.get("notice", "")
-        self.footer.default = d.get("footer", "")
+        self.description.default = d.get("description", "")[:1800]
+        self.details.default = d.get("details", "")[:1800]
+        self.notice.default = d.get("notice", "")[:1200]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         get_store().update_machine_design(
@@ -2172,8 +2183,9 @@ class DesignTextModal(discord.ui.Modal, title="自販機テキスト"):
             title=str(self.title_text.value),
             subtitle=str(self.subtitle.value or ""),
             description=str(self.description.value or ""),
+            details=str(self.details.value or ""),
             notice=str(self.notice.value or ""),
-            footer=str(self.footer.value or ""),
+            footer=get_machine(self.machine_id)["design"].get("footer", ""),
         )
         get_store().add_log("design_text", interaction.user.id, f"{self.machine_id} テキスト更新")
         await persist_store()
@@ -2540,6 +2552,258 @@ async def refresh_all_purchase_panels() -> None:
 
 
 # -----------------------------
+# Dedicated vending-panel editor
+# -----------------------------
+
+class VendingPanelHomeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        options = [
+            discord.SelectOption(label=m["name"][:100], value=mid, description=f"ID: {mid}")
+            for mid, m in list(get_store().machines.items())[:25]
+        ]
+        if options:
+            self.add_item(VendingPanelMachineSelect(options))
+
+
+class VendingPanelMachineSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="編集する自販機を選択", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content=None,
+            embed=vending_panel_embed(self.values[0]),
+            view=VendingPanelView(self.values[0])
+        )
+
+
+def vending_panel_embed(machine_id: str) -> discord.Embed:
+    machine = get_machine(machine_id)
+    if not machine:
+        return discord.Embed(title="自販機が見つかりません")
+    d = machine["design"]
+    embed = discord.Embed(
+        title=f"🖥️ 自販機パネル編集 - {machine['name']}",
+        description=(
+            "ここから購入パネルの表示内容だけを編集できます。\n"
+            "画像はDiscordへファイルをドラッグ＆ドロップして設定できます。"
+        ),
+        color=design_color(machine),
+    )
+    embed.add_field(name="タイトル", value=safe_text(d.get("title"))[:256] or "なし", inline=False)
+    embed.add_field(name="説明", value=safe_text(d.get("description"))[:600] or "なし", inline=False)
+    embed.add_field(name="詳細案内", value=safe_text(d.get("details"))[:600] or "なし", inline=False)
+    embed.add_field(name="パネル写真", value="設定済み" if d.get("banner_url") else "未設定", inline=True)
+    embed.add_field(name="背景色", value=str(d.get("color", "purple")), inline=True)
+    embed.add_field(name="お知らせ", value="設定済み" if d.get("news") else "未設定", inline=True)
+    return embed
+
+
+class VendingPanelView(discord.ui.View):
+    def __init__(self, machine_id: str):
+        super().__init__(timeout=300)
+        self.machine_id = machine_id
+
+    @discord.ui.button(label="📨 メッセージ送信", style=discord.ButtonStyle.primary, row=0)
+    async def message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="送信先チャンネルを選択してください。",
+            embed=None,
+            view=VendingPanelMessageChannelView(self.machine_id, interaction.guild)
+        )
+
+    @discord.ui.button(label="✏️ タイトル・説明", style=discord.ButtonStyle.primary, row=0)
+    async def text(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PanelTextModal(self.machine_id))
+
+    @discord.ui.button(label="📎 写真追加", style=discord.ButtonStyle.success, row=0)
+    async def photo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            f"📎 パネル写真は `/panel_photo` で追加できます。\n\n自販機: `{self.machine_id}`\nDiscordの添付欄へ画像をドラッグ＆ドロップしてください。",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="🎨 背景変更", style=discord.ButtonStyle.secondary, row=1)
+    async def background(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=None,
+            embed=vending_panel_embed(self.machine_id),
+            view=VendingPanelColorView(self.machine_id)
+        )
+
+    @discord.ui.button(label="📢 お知らせ", style=discord.ButtonStyle.secondary, row=1)
+    async def news(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PanelNewsModal(self.machine_id))
+
+    @discord.ui.button(label="👁️ プレビュー", style=discord.ButtonStyle.secondary, row=1)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=vending_embed(self.machine_id), view=VendingPanelPreviewView(self.machine_id))
+
+    @discord.ui.button(label="↩ 自販機選択", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="編集する自販機を選択してください。", embed=None, view=VendingPanelHomeView())
+
+
+class PanelTextModal(discord.ui.Modal, title="タイトル・説明を編集"):
+    title_text = discord.ui.TextInput(label="タイトル", max_length=256)
+    description = discord.ui.TextInput(label="説明", style=discord.TextStyle.paragraph, max_length=1800, required=False)
+    details = discord.ui.TextInput(label="詳しい説明・使い方", style=discord.TextStyle.paragraph, max_length=1800, required=False)
+    notice = discord.ui.TextInput(label="ご案内", style=discord.TextStyle.paragraph, max_length=1200, required=False)
+
+    def __init__(self, machine_id: str):
+        super().__init__()
+        self.machine_id = machine_id
+        d = get_machine(machine_id)["design"]
+        self.title_text.default = d.get("title", "")
+        self.description.default = d.get("description", "")[:1800]
+        self.details.default = d.get("details", "")[:1800]
+        self.notice.default = d.get("notice", "")[:1200]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        get_store().update_machine_design(
+            self.machine_id,
+            title=str(self.title_text.value or "キラの自動販売機"),
+            description=str(self.description.value or ""),
+            details=str(self.details.value or ""),
+            notice=str(self.notice.value or ""),
+        )
+        get_store().add_log("panel_text", interaction.user.id, f"{self.machine_id} タイトル・説明更新")
+        await persist_store()
+        await maybe_update_panel(self.machine_id)
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class PanelNewsModal(discord.ui.Modal, title="お知らせ"):
+    news = discord.ui.TextInput(label="お知らせ", style=discord.TextStyle.paragraph, max_length=900, required=False)
+
+    def __init__(self, machine_id: str):
+        super().__init__()
+        self.machine_id = machine_id
+        self.news.default = get_machine(machine_id)["design"].get("news", "")[:900]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        get_store().update_machine_design(self.machine_id, news=str(self.news.value or ""))
+        get_store().add_log("panel_news", interaction.user.id, f"{self.machine_id} お知らせ更新")
+        await persist_store()
+        await maybe_update_panel(self.machine_id)
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class VendingPanelColorView(discord.ui.View):
+    def __init__(self, machine_id: str):
+        super().__init__(timeout=300)
+        self.machine_id = machine_id
+        options = [
+            discord.SelectOption(label=k.capitalize(), value=k, default=(get_machine(machine_id)["design"].get("color") == k))
+            for k in COLOR_MAP
+        ]
+        self.add_item(VendingPanelColorSelect(machine_id, options))
+        self.add_item(VendingPanelColorBack(machine_id))
+
+
+class VendingPanelColorSelect(discord.ui.Select):
+    def __init__(self, machine_id: str, options: list[discord.SelectOption]):
+        super().__init__(placeholder="背景色を選択", options=options, min_values=1, max_values=1)
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        get_store().update_machine_design(self.machine_id, color=self.values[0])
+        get_store().add_log("panel_background", interaction.user.id, f"{self.machine_id}: {self.values[0]}")
+        await persist_store()
+        await maybe_update_panel(self.machine_id)
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class VendingPanelColorBack(discord.ui.Button):
+    def __init__(self, machine_id: str):
+        super().__init__(label="↩ 戻る", style=discord.ButtonStyle.secondary)
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class VendingPanelPreviewView(discord.ui.View):
+    def __init__(self, machine_id: str):
+        super().__init__(timeout=300)
+        self.machine_id = machine_id
+
+    @discord.ui.button(label="↩ 編集へ戻る", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class VendingPanelMessageChannelView(discord.ui.View):
+    def __init__(self, machine_id: str, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.machine_id = machine_id
+        options = [
+            discord.SelectOption(label=c.name[:100], value=str(c.id))
+            for c in guild.text_channels[:25]
+        ]
+        if options:
+            self.add_item(VendingPanelMessageChannelSelect(machine_id, options))
+        self.add_item(VendingPanelMessageBack(machine_id))
+
+
+class VendingPanelMessageChannelSelect(discord.ui.Select):
+    def __init__(self, machine_id: str, options: list[discord.SelectOption]):
+        super().__init__(placeholder="送信先チャンネル", options=options, min_values=1, max_values=1)
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        channel = interaction.guild.get_channel(int(self.values[0]))
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ チャンネルが見つかりません。", ephemeral=True)
+            return
+        await interaction.response.send_modal(PanelMessageModal(self.machine_id, channel.id, channel.name))
+
+
+class PanelMessageModal(discord.ui.Modal, title="メッセージ送信"):
+    content = discord.ui.TextInput(label="メッセージ", style=discord.TextStyle.paragraph, max_length=4000)
+
+    def __init__(self, machine_id: str, channel_id: int, channel_name: str):
+        super().__init__()
+        self.machine_id = machine_id
+        self.channel_id = channel_id
+        self.channel_name = channel_name
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        channel = interaction.guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ チャンネルが見つかりません。", ephemeral=True)
+            return
+        try:
+            await channel.send(safe_text(str(self.content.value)))
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Botにそのチャンネルへのメッセージ送信権限がありません。", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message("❌ Discordへの送信に失敗しました。もう一度試してください。", ephemeral=True)
+            return
+        get_store().add_log("panel_message", interaction.user.id, f"#{self.channel_name} へ送信")
+        await persist_store()
+        await interaction.response.send_message(f"✅ #{self.channel_name} に送信しました。", ephemeral=True)
+
+
+class VendingPanelMessageBack(discord.ui.Button):
+    def __init__(self, machine_id: str):
+        super().__init__(label="↩ 戻る", style=discord.ButtonStyle.secondary)
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+def is_image_attachment(attachment: discord.Attachment) -> bool:
+    content_type = str(attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return True
+    return str(attachment.filename or "").lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"))
+
+
+# -----------------------------
 # Commands
 # -----------------------------
 
@@ -2553,6 +2817,17 @@ class AdminCog(commands.Cog):
             await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
             return
         await interaction.response.send_message("🛠️ **キラの自動販売機 管理パネル**", view=AdminPanelView(), ephemeral=True)
+
+    @app_commands.command(name="panel", description="自販機パネル専用編集画面を開く")
+    async def panel(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🖥️ **自販機パネル専用編集**\n編集したい自販機を選択してください。",
+            view=VendingPanelHomeView(),
+            ephemeral=True
+        )
 
     @app_commands.command(name="setup_vending", description="自販機パネルを設置/更新")
     @app_commands.describe(vending_id="自販機ID", channel="設置チャンネル")
@@ -2591,22 +2866,39 @@ class AdminCog(commands.Cog):
         except ValueError:
             await interaction.response.send_message("❌ 価格・在庫を確認してください。", ephemeral=True)
 
-    @app_commands.command(name="product_image", description="商品画像URLを設定")
-    @app_commands.describe(vending_id="自販機ID", product_id="商品ID", image_url="画像URL")
+    @app_commands.command(name="product_image", description="商品画像をファイル添付で設定")
+    @app_commands.describe(vending_id="自販機ID", product_id="商品ID", image="設定する画像（そのままドラッグ＆ドロップ）")
     @admin_only()
-    async def product_image(self, interaction: discord.Interaction, vending_id: str, product_id: str, image_url: str):
+    async def product_image(self, interaction: discord.Interaction, vending_id: str, product_id: str, image: discord.Attachment):
         p = get_store().machine_products(vending_id).get(product_id)
         if not p:
             await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
             return
-        if image_url and not valid_http_url(image_url):
-            await interaction.response.send_message("❌ URLを確認してください。", ephemeral=True)
+        if not is_image_attachment(image):
+            await interaction.response.send_message("❌ PNG / JPG / GIF / WEBP などの画像ファイルを指定してください。", ephemeral=True)
             return
-        get_store().edit_product(vending_id, product_id, image_url=image_url)
-        get_store().add_log("product_image", interaction.user.id, f"{vending_id}/{product_id}")
+        get_store().edit_product(vending_id, product_id, image_url=image.url)
+        get_store().add_log("product_image", interaction.user.id, f"{vending_id}/{product_id} 添付: {image.filename}")
         await persist_store()
         await maybe_update_panel(vending_id)
-        await interaction.response.send_message("✅ 商品画像を更新しました。", ephemeral=True)
+        await interaction.response.send_message("✅ 商品画像を設定しました。画像ファイルはドラッグ＆ドロップだけでOKです。", ephemeral=True)
+
+    @app_commands.command(name="panel_photo", description="自販機パネル写真をファイル添付で設定")
+    @app_commands.describe(vending_id="自販機ID", image="パネル写真（そのままドラッグ＆ドロップ）")
+    @admin_only()
+    async def panel_photo(self, interaction: discord.Interaction, vending_id: str, image: discord.Attachment):
+        machine = get_machine(vending_id)
+        if not machine:
+            await interaction.response.send_message("❌ 自販機が見つかりません。", ephemeral=True)
+            return
+        if not is_image_attachment(image):
+            await interaction.response.send_message("❌ 画像ファイルを指定してください。", ephemeral=True)
+            return
+        get_store().update_machine_design(vending_id, banner_url=image.url)
+        get_store().add_log("panel_photo", interaction.user.id, f"{vending_id} パネル写真: {image.filename}")
+        await persist_store()
+        await maybe_update_panel(vending_id)
+        await interaction.response.send_message("✅ パネル写真を設定しました。", ephemeral=True)
 
     @app_commands.command(name="history", description="自分の購入履歴")
     async def history(self, interaction: discord.Interaction):
