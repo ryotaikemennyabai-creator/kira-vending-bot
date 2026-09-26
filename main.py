@@ -362,8 +362,10 @@ class VendingStore:
             self.logs = self.logs[-5000:]
         return item
 
-    def create_machine(self, name: str, base_id: str = "machine") -> Dict[str, Any]:
-        mid = self.ensure_unique_machine_id(base_id)
+    def create_machine(self, name: str, base_id: str = "") -> Dict[str, Any]:
+        # Internal IDs are generated automatically. Administrators do not need to type them.
+        preferred = str(base_id or "").strip() or "machine"
+        mid = self.ensure_unique_machine_id(preferred)
         machine = deepcopy(DEFAULT_MACHINE)
         machine["id"] = mid
         machine["name"] = str(name or mid)[:100]
@@ -794,11 +796,18 @@ def get_store() -> VendingStore:
 async def persist_store() -> None:
     store = get_store()
     async with DATA_LOCK:
-        save_json(CONFIG_FILE, store.dump_config())
-        save_json(PRODUCTS_FILE, store.dump_products())
-        save_json(ORDERS_FILE, store.dump_orders())
-        save_json(COUPONS_FILE, store.dump_coupons())
-        save_json(LOGS_FILE, store.dump_logs())
+        snapshots = (
+            store.dump_config(),
+            store.dump_products(),
+            store.dump_orders(),
+            store.dump_coupons(),
+            store.dump_logs(),
+        )
+        await asyncio.to_thread(save_json, CONFIG_FILE, snapshots[0])
+        await asyncio.to_thread(save_json, PRODUCTS_FILE, snapshots[1])
+        await asyncio.to_thread(save_json, ORDERS_FILE, snapshots[2])
+        await asyncio.to_thread(save_json, COUPONS_FILE, snapshots[3])
+        await asyncio.to_thread(save_json, LOGS_FILE, snapshots[4])
 
 
 # -----------------------------
@@ -865,6 +874,35 @@ def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         return is_admin(interaction)
     return app_commands.check(predicate)
+
+
+async def safe_interaction_message(
+    interaction: discord.Interaction, content: str, *, ephemeral: bool = True
+) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except (discord.HTTPException, discord.NotFound):
+        pass
+
+
+class KiraView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item, /) -> None:
+        print(f"[VIEW ERROR] item={type(item).__name__}: {error!r}")
+        traceback.print_exc()
+        await safe_interaction_message(
+            interaction, "❌ 処理中にエラーが発生しました。もう一度お試しください。"
+        )
+
+
+class AdminKiraView(KiraView):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_admin(interaction):
+            await safe_interaction_message(interaction, "❌ この管理画面は管理者のみ使用できます。")
+            return False
+        return True
 
 
 def get_machine(machine_id: str) -> Optional[dict[str, Any]]:
@@ -983,21 +1021,52 @@ def product_embed(machine_id: str, product_id: str, coupon_code: str = "") -> di
 
 def machine_autocomplete(current: str) -> list[app_commands.Choice[str]]:
     query = (current or "").lower()
-    choices = []
-    for mid, m in get_store().machines.items():
-        label = f"{m['name']} ({mid})"
-        if query in label.lower() or query in mid.lower():
-            choices.append(app_commands.Choice(name=label[:100], value=mid))
+    choices: list[app_commands.Choice[str]] = []
+    for mid, machine in get_store().machines.items():
+        name = str(machine.get("name") or "自販機")
+        if not query or query in name.lower():
+            choices.append(app_commands.Choice(name=name[:100], value=mid))
     return choices[:25]
+
+
+async def machine_autocomplete_for_interaction(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return machine_autocomplete(current)
 
 
 def product_autocomplete(machine_id: str, current: str) -> list[app_commands.Choice[str]]:
     query = (current or "").lower()
-    choices = []
-    for pid, p in get_store().machine_products(machine_id).items():
-        label = f"{p['name']} [{pid}]"
-        if query in label.lower() or query in pid.lower():
+    choices: list[app_commands.Choice[str]] = []
+    for pid, product in get_store().machine_products(machine_id).items():
+        name = str(product.get("name") or "商品")
+        label = f"{product.get('emoji', '📦')} {name} · {money(int(product.get('price', 0)))}"
+        if not query or query in name.lower() or query in label.lower():
             choices.append(app_commands.Choice(name=label[:100], value=pid))
+    return choices[:25]
+
+
+async def product_autocomplete_for_interaction(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    namespace = getattr(interaction, "namespace", None)
+    machine_id = str(getattr(namespace, "vending", "") or getattr(namespace, "machine", "") or "")
+    return product_autocomplete(machine_id, current) if machine_id else []
+
+
+async def order_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    query = (current or "").lower()
+    choices: list[app_commands.Choice[str]] = []
+    for order in get_store().orders:
+        order_id = str(order.get("order_id", ""))
+        product_name = str(order.get("product_name", "商品"))
+        if not order_id:
+            continue
+        label = f"{product_name} · {order_id}"
+        if not query or query in order_id.lower() or query in product_name.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=order_id))
     return choices[:25]
 
 
@@ -1091,7 +1160,7 @@ async def create_ticket(guild: discord.Guild, order: dict[str, Any]) -> Optional
 # Purchase UI
 # -----------------------------
 
-class PurchaseView(discord.ui.View):
+class PurchaseView(KiraView):
     def __init__(self, machine_id: str, page: int = 0, category: Optional[str] = None):
         super().__init__(timeout=None)
         self.machine_id = machine_id
@@ -1180,7 +1249,7 @@ class RefreshPanelButton(discord.ui.Button):
         await interaction.response.edit_message(embed=vending_embed(self.machine_id), view=PurchaseView(self.machine_id, 0, "__all__"))
 
 
-class ProductDetailView(discord.ui.View):
+class ProductDetailView(KiraView):
     def __init__(self, machine_id: str, product_id: str):
         super().__init__(timeout=180)
         self.machine_id = machine_id
@@ -1223,7 +1292,7 @@ def purchase_confirm_embed(info: dict[str, Any], coupon_code: str = "") -> disco
     return embed
 
 
-class PurchaseConfirmView(discord.ui.View):
+class PurchaseConfirmView(KiraView):
     def __init__(self, machine_id: str, product_id: str, coupon_code: str = ""):
         super().__init__(timeout=180)
         self.machine_id = machine_id
@@ -1406,7 +1475,7 @@ async def low_stock_alert(guild: discord.Guild) -> None:
 # Order action UI / global interaction fallback
 # -----------------------------
 
-class RawActionButtonView(discord.ui.View):
+class RawActionButtonView(KiraView):
     def __init__(self, order_id: str, include_ticket: bool = False):
         super().__init__(timeout=None)
         if include_ticket:
@@ -1425,15 +1494,16 @@ async def handle_order_paid(interaction: discord.Interaction, order_id: str) -> 
     if not is_admin(interaction):
         await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     try:
         order = get_store().mark_paid(order_id, interaction.user.id)
         await persist_store()
     except ValueError as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
         return
     embed = order_embed(order, get_machine(order["vending_id"]))
     embed.set_footer(text="✅ 支払い確認済み")
-    await interaction.response.edit_message(embed=embed, view=OrderActionView(order_id))
+    await interaction.edit_original_response(embed=embed, view=OrderActionView(order_id))
     await update_order_ticket(order)
     await safe_dm(
         interaction.client.get_user(int(order["buyer_id"])) or await interaction.client.fetch_user(int(order["buyer_id"])),
@@ -1447,15 +1517,16 @@ async def handle_order_cancel(interaction: discord.Interaction, order_id: str) -
     if not is_admin(interaction):
         await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     try:
         order = get_store().cancel_order(order_id, interaction.user.id)
         await persist_store()
     except ValueError as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
         return
     embed = order_embed(order, get_machine(order["vending_id"]))
     embed.set_footer(text="❌ 注文はキャンセルされました")
-    await interaction.response.edit_message(embed=embed, view=OrderActionView(order_id))
+    await interaction.edit_original_response(embed=embed, view=OrderActionView(order_id))
     await update_order_ticket(order)
     user = interaction.client.get_user(int(order["buyer_id"]))
     if user is None:
@@ -1483,18 +1554,19 @@ async def handle_ticket_archive(interaction: discord.Interaction, order_id: str)
     if not is_admin(interaction):
         await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     category = await get_or_create_archive_category(interaction.guild)
     if isinstance(interaction.channel, discord.TextChannel):
         await interaction.channel.edit(category=category, reason=f"注文 {order_id} を履歴へ移動")
-    await interaction.response.send_message("📁 購入履歴へ移動しました。", ephemeral=True)
+    await interaction.edit_original_response(content="📁 購入履歴へ移動しました。")
 
 
 async def handle_ticket_delete(interaction: discord.Interaction, order_id: str) -> None:
     if not is_admin(interaction):
         await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
         return
-    await interaction.response.send_message("🗑️ チケットを削除します。", ephemeral=True)
-    await asyncio.sleep(1)
+    await interaction.response.defer(ephemeral=True)
+    await asyncio.sleep(0.5)
     if isinstance(interaction.channel, discord.TextChannel):
         await interaction.channel.delete(reason=f"注文 {order_id} チケット削除")
 
@@ -1503,7 +1575,7 @@ async def handle_ticket_delete(interaction: discord.Interaction, order_id: str) 
 # History / ranking UI
 # -----------------------------
 
-class HistoryView(discord.ui.View):
+class HistoryView(KiraView):
     def __init__(self, user_id: int, page: int = 0):
         super().__init__(timeout=180)
         self.user_id = user_id
@@ -1544,7 +1616,7 @@ def history_embed(user_id: int, page: int = 0) -> discord.Embed:
     return embed
 
 
-class RankingView(discord.ui.View):
+class RankingView(KiraView):
     def __init__(self):
         super().__init__(timeout=180)
         self.add_item(discord.ui.Button(label="🔄 更新", style=discord.ButtonStyle.secondary, custom_id="kira:ranking_refresh"))
@@ -1571,7 +1643,7 @@ def ranking_embed() -> discord.Embed:
 # Admin panels
 # -----------------------------
 
-class AdminPanelView(discord.ui.View):
+class AdminPanelView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -1618,7 +1690,7 @@ class AdminPanelView(discord.ui.View):
         await interaction.response.edit_message(content=None, embed=ranking_embed(), view=AdminBackView())
 
 
-class AdminBackView(discord.ui.View):
+class AdminBackView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -1642,7 +1714,7 @@ def stats_embed() -> discord.Embed:
     return embed
 
 
-class AdminStatsView(discord.ui.View):
+class AdminStatsView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -1659,12 +1731,12 @@ class AdminStatsView(discord.ui.View):
         await interaction.response.edit_message(content="管理パネル", embed=None, view=AdminPanelView())
 
 
-class MachineManagerView(discord.ui.View):
+class MachineManagerView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
         options = []
         for mid, m in list(get_store().machines.items())[:25]:
-            options.append(discord.SelectOption(label=m["name"][:100], value=mid, description=f"ID: {mid}") )
+            options.append(discord.SelectOption(label=m["name"][:100], value=mid) )
         if options:
             self.add_item(MachineSelect(options))
         self.add_item(CreateMachineButton())
@@ -1697,20 +1769,23 @@ class AdminHomeButton(discord.ui.Button):
 
 class MachineCreateModal(discord.ui.Modal, title="自販機を作成"):
     name = discord.ui.TextInput(label="自販機名", placeholder="例: ゲーム自販機", max_length=100)
-    machine_id = discord.ui.TextInput(label="自販機ID", placeholder="例: game", max_length=32)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         store = get_store()
         try:
+            await interaction.response.defer(ephemeral=True)
             async with DATA_LOCK:
-                machine = store.create_machine(str(self.name.value), str(self.machine_id.value))
-                store.add_log("machine_create", interaction.user.id, f"自販機 {machine['id']} を作成")
-                save_json(CONFIG_FILE, store.dump_config())
-                save_json(PRODUCTS_FILE, store.dump_products())
-                save_json(LOGS_FILE, store.dump_logs())
-            await interaction.response.edit_message(content=f"✅ `{machine['name']}` を作成しました。", embed=machine_admin_embed(machine["id"]), view=MachineAdminView(machine["id"]))
+                machine = store.create_machine(str(self.name.value))
+                store.add_log("machine_create", interaction.user.id, f"自販機 {machine['name']} を作成")
+            await persist_store()
+            await interaction.followup.send(
+                f"✅ `{machine['name']}` を作成しました。",
+                embed=machine_admin_embed(machine["id"]),
+                view=MachineAdminView(machine["id"]),
+                ephemeral=True,
+            )
         except ValueError as e:
-            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            await safe_interaction_message(interaction, f"❌ {e}")
 
 
 def machine_admin_embed(machine_id: str) -> discord.Embed:
@@ -1719,7 +1794,7 @@ def machine_admin_embed(machine_id: str) -> discord.Embed:
         return discord.Embed(title="自販機が見つかりません")
     p = list(machine["products"].values())
     sold = sum(1 for x in p if int(x.get("stock", 0)) == 0)
-    embed = discord.Embed(title=f"🛠️ {machine['name']}", description=f"ID: `{machine_id}`", color=design_color(machine))
+    embed = discord.Embed(title=f"🛠️ {machine['name']}", description="必要な項目をボタンから選択してください。", color=design_color(machine))
     embed.add_field(name="商品数", value=f"{len(p)}", inline=True)
     embed.add_field(name="売り切れ", value=f"{sold}", inline=True)
     embed.add_field(name="状態", value="🔴 メンテナンス" if machine["design"].get("maintenance") else "🟢 営業中", inline=True)
@@ -1728,7 +1803,7 @@ def machine_admin_embed(machine_id: str) -> discord.Embed:
     return embed
 
 
-class MachineAdminView(discord.ui.View):
+class MachineAdminView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -1743,8 +1818,11 @@ class MachineAdminView(discord.ui.View):
 
     @discord.ui.button(label="📺 パネル設置", style=discord.ButtonStyle.success, row=0)
     async def deploy(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await deploy_purchase_panel(interaction.guild, self.machine_id)
-        await interaction.response.edit_message(embed=machine_admin_embed(self.machine_id), view=self)
+        await interaction.response.edit_message(
+            content="📺 **販売パネルを置くチャンネルを選択してください。**\n購入チャンネルとは別に設定します。",
+            embed=None,
+            view=PanelChannelView(self.machine_id),
+        )
 
     @discord.ui.button(label="🔧 購入チャンネル", style=discord.ButtonStyle.secondary, row=1)
     async def channel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1752,12 +1830,13 @@ class MachineAdminView(discord.ui.View):
 
     @discord.ui.button(label="🔴/🟢 メンテナンス", style=discord.ButtonStyle.secondary, row=1)
     async def maintenance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         machine = get_machine(self.machine_id)
         machine["design"]["maintenance"] = not bool(machine["design"].get("maintenance"))
         get_store().add_log("maintenance_toggle", interaction.user.id, f"{self.machine_id}: {machine['design']['maintenance']}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=machine_admin_embed(self.machine_id), view=self)
+        await interaction.edit_original_response(embed=machine_admin_embed(self.machine_id), view=self)
 
     @discord.ui.button(label="📢 お知らせ", style=discord.ButtonStyle.secondary, row=1)
     async def news(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1783,15 +1862,14 @@ class MachineDeleteConfirmModal(discord.ui.Modal, title="自販機を削除"):
         if str(self.confirmation.value).strip().upper() != "DELETE":
             await interaction.response.send_message("❌ `DELETE` と入力してください。", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         async with DATA_LOCK:
             if not get_store().delete_machine(self.machine_id):
-                await interaction.response.send_message("❌ 最後の1台、または支払い確認待ちの注文がある自販機は削除できません。", ephemeral=True)
+                await interaction.followup.send("❌ 最後の1台、または支払い確認待ちの注文がある自販機は削除できません。", ephemeral=True)
                 return
             get_store().add_log("machine_delete", interaction.user.id, f"自販機 {self.machine_id} を削除")
-            save_json(CONFIG_FILE, get_store().dump_config())
-            save_json(PRODUCTS_FILE, get_store().dump_products())
-            save_json(LOGS_FILE, get_store().dump_logs())
-        await interaction.response.edit_message(content="✅ 自販機を削除しました。", embed=None, view=MachineManagerView())
+        await persist_store()
+        await interaction.edit_original_response(content="✅ 自販機を削除しました。", embed=None, view=MachineManagerView())
 
 
 class NewsModal(discord.ui.Modal, title="お知らせ設定"):
@@ -1803,36 +1881,122 @@ class NewsModal(discord.ui.Modal, title="お知らせ設定"):
         self.news.default = get_machine(machine_id)["design"].get("news", "")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, news=str(self.news.value or ""))
         get_store().add_log("news_update", interaction.user.id, f"{self.machine_id} お知らせ更新")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=machine_admin_embed(self.machine_id), view=MachineAdminView(self.machine_id))
+        await interaction.followup.send("✅ お知らせを更新しました。", embed=machine_admin_embed(self.machine_id), view=MachineAdminView(self.machine_id), ephemeral=True)
 
 
-class MachineChannelView(discord.ui.View):
+class MachineChannelView(AdminKiraView):
     def __init__(self, machine_id: str, guild: discord.Guild):
         super().__init__(timeout=300)
         self.machine_id = machine_id
-        channels = [c for c in guild.text_channels if c.category is not None or c.category is None]
-        options = [discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in channels[:25]]
-        if options:
-            self.add_item(MachineChannelSelect(machine_id, options))
+        current = get_machine(machine_id)
+        default = []
+        if current and int(current.get("purchase_channel_id", 0) or 0):
+            channel = guild.get_channel(int(current["purchase_channel_id"]))
+            if isinstance(channel, discord.TextChannel):
+                default = [channel]
+        self.add_item(
+            discord.ui.ChannelSelect(
+                custom_id=f"kira:purchase_channel:{machine_id}",
+                channel_types=[discord.ChannelType.text],
+                placeholder="購入チャンネルを選択",
+                min_values=1,
+                max_values=1,
+                default_values=default,
+            )
+        )
         self.add_item(MachineChannelBack(machine_id))
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await AdminKiraView.interaction_check(self, interaction)
 
-class MachineChannelSelect(discord.ui.Select):
-    def __init__(self, machine_id: str, options: list[discord.SelectOption]):
-        super().__init__(placeholder="購入チャンネル", options=options, min_values=1, max_values=1)
+
+class MachineChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, machine_id: str):
+        super().__init__(
+            custom_id=f"kira:purchase_channel:{machine_id}",
+            channel_types=[discord.ChannelType.text],
+            placeholder="購入チャンネルを選択",
+            min_values=1,
+            max_values=1,
+        )
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        channel_id = int(self.values[0])
+        channel = self.values[0]
         machine = get_machine(self.machine_id)
-        machine["purchase_channel_id"] = channel_id
-        get_store().add_log("purchase_channel_set", interaction.user.id, f"{self.machine_id}: {channel_id}")
+        if not machine or not isinstance(channel, discord.TextChannel):
+            await safe_interaction_message(interaction, "❌ チャンネルを確認してください。")
+            return
+        if int(machine.get("panel_channel_id", 0) or 0) == channel.id:
+            await safe_interaction_message(interaction, "❌ 購入チャンネルと販売パネルは別々にしてください。")
+            return
+        await interaction.response.defer(ephemeral=True)
+        machine["purchase_channel_id"] = channel.id
+        get_store().add_log("purchase_channel_set", interaction.user.id, f"{self.machine_id}: {channel.name}")
         await persist_store()
-        await interaction.response.edit_message(embed=machine_admin_embed(self.machine_id), view=MachineAdminView(self.machine_id))
+        await interaction.edit_original_response(
+            content=None, embed=machine_admin_embed(self.machine_id), view=MachineAdminView(self.machine_id)
+        )
+
+
+class PanelChannelView(AdminKiraView):
+    def __init__(self, machine_id: str):
+        super().__init__(timeout=300)
+        self.machine_id = machine_id
+        self.add_item(
+            PanelChannelSelect(machine_id)
+        )
+        self.add_item(PanelChannelBack(machine_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await AdminKiraView.interaction_check(self, interaction)
+
+
+class PanelChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, machine_id: str):
+        super().__init__(
+            custom_id=f"kira:panel_channel:{machine_id}",
+            channel_types=[discord.ChannelType.text],
+            placeholder="販売パネルを置くチャンネルを選択",
+            min_values=1,
+            max_values=1,
+        )
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        channel = self.values[0]
+        machine = get_machine(self.machine_id)
+        if not machine or not isinstance(channel, discord.TextChannel):
+            await safe_interaction_message(interaction, "❌ チャンネルを確認してください。")
+            return
+        if int(machine.get("purchase_channel_id", 0) or 0) == channel.id:
+            await safe_interaction_message(interaction, "❌ 販売パネルと購入チャンネルは別々にしてください。")
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await deploy_purchase_panel(interaction.guild, self.machine_id, channel)
+            await interaction.followup.send(
+                f"✅ **{machine['name']}** の販売パネルを <#{channel.id}> に設置しました。",
+                ephemeral=True,
+            )
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
+
+class PanelChannelBack(discord.ui.Button):
+    def __init__(self, machine_id: str):
+        super().__init__(label="↩ 戻る", style=discord.ButtonStyle.secondary)
+        self.machine_id = machine_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content=None, embed=machine_admin_embed(self.machine_id), view=MachineAdminView(self.machine_id)
+        )
 
 
 class MachineChannelBack(discord.ui.Button):
@@ -1855,20 +2019,20 @@ def product_admin_embed(machine_id: str) -> discord.Embed:
         return embed
     lines = []
     for p in products[:25]:
-        lines.append(f"{p.get('emoji','📦')} **{p['name']}** — {money(p['price'])} / {stock_label(p)} / `{p['id']}`")
+        lines.append(f"{p.get('emoji','📦')} **{p['name']}** — {money(p['price'])} / {stock_label(p)}")
     embed.description = "\n".join(lines)
     if len(products) > 25:
         embed.set_footer(text=f"先頭25件を表示 / 全{len(products)}件")
     return embed
 
 
-class ProductAdminView(discord.ui.View):
+class ProductAdminView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
         options = []
         for pid, p in list(get_store().machine_products(machine_id).items())[:25]:
-            options.append(discord.SelectOption(label=p["name"][:100], value=pid, description=f"{money(p['price'])} / 在庫 {p['stock']}"))
+            options.append(discord.SelectOption(label=p["name"][:100], value=pid, description=stock_label(p)))
         if options:
             self.add_item(ProductAdminSelect(machine_id, options))
         self.add_item(ProductAddButton(machine_id))
@@ -1914,6 +2078,7 @@ class ProductAddModal(discord.ui.Modal, title="商品を追加"):
         self.machine_id = machine_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         try:
             price = int(self.price.value)
             stock = int(self.stock.value)
@@ -1933,12 +2098,16 @@ class ProductAddModal(discord.ui.Modal, title="商品を追加"):
                     },
                 )
                 get_store().add_log("product_add", interaction.user.id, f"{self.machine_id}/{product['id']} を追加")
-                save_json(CONFIG_FILE, get_store().dump_config())
-                save_json(PRODUCTS_FILE, get_store().dump_products())
-                save_json(LOGS_FILE, get_store().dump_logs())
-            await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, product["id"]), view=ProductEditView(self.machine_id, product["id"]))
-        except (ValueError, KeyError) as e:
-            await interaction.response.send_message(f"❌ 入力を確認してください。{e}", ephemeral=True)
+            await persist_store()
+            await maybe_update_panel(self.machine_id)
+            await interaction.followup.send(
+                f"✅ **{product['name']}** を追加しました。",
+                embed=product_detail_admin_embed(self.machine_id, product["id"]),
+                view=ProductEditView(self.machine_id, product["id"]),
+                ephemeral=True,
+            )
+        except (ValueError, KeyError):
+            await interaction.followup.send("❌ 価格・在庫・購入上限を確認してください。", ephemeral=True)
 
 
 def product_detail_admin_embed(machine_id: str, product_id: str) -> discord.Embed:
@@ -1954,7 +2123,7 @@ def product_detail_admin_embed(machine_id: str, product_id: str) -> discord.Embe
     return embed
 
 
-class ProductEditView(discord.ui.View):
+class ProductEditView(AdminKiraView):
     def __init__(self, machine_id: str, product_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -1968,21 +2137,19 @@ class ProductEditView(discord.ui.View):
     async def stock(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(StockModal(self.machine_id, self.product_id))
 
-    @discord.ui.button(label="📎 画像追加", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="📎 写真を追加", style=discord.ButtonStyle.secondary, row=0)
     async def image(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            f"📎 商品画像はURL入力ではなく、Discordの `/product_image` で画像ファイルをそのままドラッグ＆ドロップして設定できます。\n\n自販機: `{self.machine_id}`\n商品ID: `{self.product_id}`",
-            ephemeral=True
-        )
+        await interaction.response.send_modal(ProductImageUploadModal(self.machine_id, self.product_id))
 
     @discord.ui.button(label="🔄 販売ON/OFF", style=discord.ButtonStyle.secondary, row=1)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         p = get_store().machine_products(self.machine_id)[self.product_id]
         get_store().set_product_active(self.machine_id, self.product_id, not p["active"])
         get_store().add_log("product_toggle", interaction.user.id, f"{self.machine_id}/{self.product_id}: {not p['active']}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, self.product_id), view=self)
+        await interaction.edit_original_response(embed=product_detail_admin_embed(self.machine_id, self.product_id), view=self)
 
     @discord.ui.button(label="🗑️ 削除", style=discord.ButtonStyle.danger, row=1)
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2019,6 +2186,7 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
             limit = int(self.purchase_limit.value or 0)
             if price < 0 or limit < 0:
                 raise ValueError
+            await interaction.response.defer(ephemeral=True)
             get_store().edit_product(
                 self.machine_id,
                 self.product_id,
@@ -2032,9 +2200,9 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
             get_store().add_log("product_edit", interaction.user.id, f"{self.machine_id}/{self.product_id} を編集")
             await persist_store()
             await maybe_update_panel(self.machine_id)
-            await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, self.product_id), view=ProductEditView(self.machine_id, self.product_id))
+            await interaction.followup.send("✅ 商品情報を更新しました。", embed=product_detail_admin_embed(self.machine_id, self.product_id), view=ProductEditView(self.machine_id, self.product_id), ephemeral=True)
         except ValueError:
-            await interaction.response.send_message("❌ 入力が正しくありません。", ephemeral=True)
+            await safe_interaction_message(interaction, "❌ 入力が正しくありません。")
 
 
 class StockModal(discord.ui.Modal, title="在庫変更"):
@@ -2049,35 +2217,56 @@ class StockModal(discord.ui.Modal, title="在庫変更"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
             value = max(0, int(self.stock.value))
+            await interaction.response.defer(ephemeral=True)
             get_store().set_stock(self.machine_id, self.product_id, value)
             get_store().add_log("stock_change", interaction.user.id, f"{self.machine_id}/{self.product_id}: {value}")
             await persist_store()
             await maybe_update_panel(self.machine_id)
-            await low_stock_alert(interaction.guild)
-            await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, self.product_id), view=ProductEditView(self.machine_id, self.product_id))
+            # Low-stock notification is useful, but should never hold the user's interaction open.
+            asyncio.create_task(low_stock_alert(interaction.guild))
+            await interaction.followup.send("✅ 在庫を更新しました。", embed=product_detail_admin_embed(self.machine_id, self.product_id), view=ProductEditView(self.machine_id, self.product_id), ephemeral=True)
         except ValueError:
-            await interaction.response.send_message("❌ 数字を入力してください。", ephemeral=True)
+            await safe_interaction_message(interaction, "❌ 数字を入力してください。")
 
 
-class ProductImageModal(discord.ui.Modal, title="商品画像URL"):
-    image_url = discord.ui.TextInput(label="画像URL", placeholder="https://...", required=False, max_length=2048)
+class ProductImageUploadModal(discord.ui.Modal, title="商品写真を追加"):
+    upload = discord.ui.FileUpload(
+        custom_id="kira:product_image_upload",
+        required=True,
+        min_values=1,
+        max_values=1,
+    )
 
     def __init__(self, machine_id: str, product_id: str):
         super().__init__()
         self.machine_id = machine_id
         self.product_id = product_id
-        self.image_url.default = get_store().machine_products(machine_id)[product_id].get("image_url", "")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        url = str(self.image_url.value or "").strip()
-        if url and not valid_http_url(url):
-            await interaction.response.send_message("❌ http/https のURLを入力してください。", ephemeral=True)
-            return
-        get_store().edit_product(self.machine_id, self.product_id, image_url=url)
-        get_store().add_log("product_image", interaction.user.id, f"{self.machine_id}/{self.product_id} 画像設定")
-        await persist_store()
-        await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, self.product_id), view=ProductEditView(self.machine_id, self.product_id))
+        await interaction.response.defer(ephemeral=True)
+        try:
+            files = list(self.upload.values or [])
+            if not files:
+                await interaction.followup.send("❌ 写真を1枚ドロップしてください。", ephemeral=True)
+                return
+            image = files[0]
+            if not is_image_attachment(image):
+                await interaction.followup.send("❌ 画像ファイルをドロップしてください。", ephemeral=True)
+                return
+            product = get_store().machine_products(self.machine_id).get(self.product_id)
+            if not product:
+                await interaction.followup.send("❌ 商品が見つかりません。", ephemeral=True)
+                return
+            get_store().edit_product(self.machine_id, self.product_id, image_url=image.url)
+            get_store().add_log("product_image", interaction.user.id, f"{product['name']} 写真: {image.filename}")
+            await persist_store()
+            await maybe_update_panel(self.machine_id)
+            await interaction.followup.send(
+                f"✅ **{product['name']}** の写真を設定しました。", ephemeral=True
+            )
+        except Exception:
+            traceback.print_exc()
+            await safe_interaction_message(interaction, "❌ 写真の設定に失敗しました。")
 
 
 class ProductDeleteModal(discord.ui.Modal, title="商品削除"):
@@ -2119,7 +2308,7 @@ def design_embed(machine_id: str) -> discord.Embed:
     return embed
 
 
-class DesignView(discord.ui.View):
+class DesignView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2138,10 +2327,7 @@ class DesignView(discord.ui.View):
 
     @discord.ui.button(label="📎 パネル写真", style=discord.ButtonStyle.secondary, row=1)
     async def banner(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            f"📎 パネル写真は `/panel_photo` で画像ファイルをそのままドラッグ＆ドロップして設定できます。\n\n自販機: `{self.machine_id}`",
-            ephemeral=True
-        )
+        await interaction.response.send_modal(PanelPhotoUploadModal(self.machine_id))
 
     @discord.ui.button(label="✨ プリセット", style=discord.ButtonStyle.success, row=1)
     async def preset(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2178,6 +2364,7 @@ class DesignTextModal(discord.ui.Modal, title="自販機テキスト"):
         self.notice.default = d.get("notice", "")[:1200]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(
             self.machine_id,
             title=str(self.title_text.value),
@@ -2190,10 +2377,10 @@ class DesignTextModal(discord.ui.Modal, title="自販機テキスト"):
         get_store().add_log("design_text", interaction.user.id, f"{self.machine_id} テキスト更新")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.followup.send("✅ テキストを更新しました。", embed=design_embed(self.machine_id), view=DesignView(self.machine_id), ephemeral=True)
 
 
-class ColorView(discord.ui.View):
+class ColorView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2208,14 +2395,15 @@ class ColorSelect(discord.ui.Select):
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, color=self.values[0])
         get_store().add_log("design_color", interaction.user.id, f"{self.machine_id}: {self.values[0]}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.followup.send("✅ 色を変更しました。", embed=design_embed(self.machine_id), view=DesignView(self.machine_id), ephemeral=True)
 
 
-class ButtonStyleView(discord.ui.View):
+class ButtonStyleView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2230,34 +2418,52 @@ class ButtonStyleSelect(discord.ui.Select):
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, button_style=self.values[0])
         get_store().add_log("design_button_style", interaction.user.id, f"{self.machine_id}: {self.values[0]}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.followup.send("✅ ボタン色を変更しました。", embed=design_embed(self.machine_id), view=DesignView(self.machine_id), ephemeral=True)
 
 
-class BannerModal(discord.ui.Modal, title="バナーURL"):
-    banner_url = discord.ui.TextInput(label="URL", placeholder="https://...", required=False, max_length=2048)
+class PanelPhotoUploadModal(discord.ui.Modal, title="自販機パネル写真"):
+    upload = discord.ui.FileUpload(
+        custom_id="kira:panel_photo_upload",
+        required=True,
+        min_values=1,
+        max_values=1,
+    )
 
     def __init__(self, machine_id: str):
         super().__init__()
         self.machine_id = machine_id
-        self.banner_url.default = get_machine(machine_id)["design"].get("banner_url", "")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        url = str(self.banner_url.value or "").strip()
-        if url and not valid_http_url(url):
-            await interaction.response.send_message("❌ URLを確認してください。", ephemeral=True)
-            return
-        get_store().update_machine_design(self.machine_id, banner_url=url)
-        get_store().add_log("design_banner", interaction.user.id, f"{self.machine_id} バナー更新")
-        await persist_store()
-        await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.response.defer(ephemeral=True)
+        try:
+            files = list(self.upload.values or [])
+            if not files:
+                await interaction.followup.send("❌ 写真を1枚ドロップしてください。", ephemeral=True)
+                return
+            image = files[0]
+            if not is_image_attachment(image):
+                await interaction.followup.send("❌ 画像ファイルをドロップしてください。", ephemeral=True)
+                return
+            machine = get_machine(self.machine_id)
+            if not machine:
+                await interaction.followup.send("❌ 自販機が見つかりません。", ephemeral=True)
+                return
+            get_store().update_machine_design(self.machine_id, banner_url=image.url)
+            get_store().add_log("panel_photo", interaction.user.id, f"{machine['name']} パネル写真: {image.filename}")
+            await persist_store()
+            await maybe_update_panel(self.machine_id)
+            await interaction.followup.send(f"✅ **{machine['name']}** のパネル写真を設定しました。", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await safe_interaction_message(interaction, "❌ パネル写真の設定に失敗しました。")
 
 
-class PresetView(discord.ui.View):
+class PresetView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2278,6 +2484,7 @@ class PresetSelect(discord.ui.Select):
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         presets = {
             "simple": {"color": "light", "button_style": "blue"},
             "purple": {"color": "purple", "button_style": "green"},
@@ -2289,7 +2496,7 @@ class PresetSelect(discord.ui.Select):
         get_store().add_log("design_preset", interaction.user.id, f"{self.machine_id}: {self.values[0]}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.followup.send("✅ プリセットを適用しました。", embed=design_embed(self.machine_id), view=DesignView(self.machine_id), ephemeral=True)
 
 
 class ButtonLabelModal(discord.ui.Modal, title="購入ボタン文字"):
@@ -2301,10 +2508,11 @@ class ButtonLabelModal(discord.ui.Modal, title="購入ボタン文字"):
         self.label.default = get_machine(machine_id)["design"].get("button_label", "購入する")
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, button_label=str(self.label.value or "購入する"))
         get_store().add_log("design_button_label", interaction.user.id, f"{self.machine_id} 購入ボタン文字更新")
         await persist_store()
-        await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
+        await interaction.followup.send("✅ 購入ボタンの文字を更新しました。", embed=design_embed(self.machine_id), view=DesignView(self.machine_id), ephemeral=True)
 
 
 class DesignBackButton(discord.ui.Button):
@@ -2316,7 +2524,7 @@ class DesignBackButton(discord.ui.Button):
         await interaction.response.edit_message(embed=design_embed(self.machine_id), view=DesignView(self.machine_id))
 
 
-class PreviewBackView(discord.ui.View):
+class PreviewBackView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2334,7 +2542,7 @@ class PreviewBackButton(discord.ui.Button):
 
 # Coupon admin
 
-class CouponAdminView(discord.ui.View):
+class CouponAdminView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
 
@@ -2410,7 +2618,7 @@ def coupon_list_embed() -> discord.Embed:
 
 # Order management
 
-class OrderManagementView(discord.ui.View):
+class OrderManagementView(AdminKiraView):
     def __init__(self, status: str = "pending", page: int = 0):
         super().__init__(timeout=300)
         self.status = status
@@ -2473,7 +2681,7 @@ def order_management_embed(status: str = "pending", page: int = 0) -> discord.Em
 
 
 # Logs
-class LogView(discord.ui.View):
+class LogView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
         self.add_item(AdminBackButton())
@@ -2496,47 +2704,86 @@ def log_embed() -> discord.Embed:
 # Panel deployment / refresh
 # -----------------------------
 
-async def deploy_purchase_panel(guild: discord.Guild, machine_id: str, channel: Optional[discord.TextChannel] = None) -> Optional[discord.Message]:
+def _channel_name_fragment(name: str, fallback: str = "vending") -> str:
+    value = re.sub(r"[^0-9A-Za-zぁ-んァ-ン一-龥ー_-]+", "-", str(name or fallback)).strip("-")
+    return (value or fallback)[:70]
+
+
+async def get_or_create_purchase_channel(
+    guild: discord.Guild, machine_id: str
+) -> discord.TextChannel:
+    machine = get_machine(machine_id)
+    if not machine:
+        raise ValueError("自販機が見つかりません")
+    cid = int(machine.get("purchase_channel_id", 0) or 0)
+    channel = guild.get_channel(cid) if cid else None
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    category = discord.utils.get(guild.categories, name="🛒 購入チャンネル")
+    if category is None:
+        category = await guild.create_category("🛒 購入チャンネル", reason="キラ自販機 購入チャンネル")
+    channel = await guild.create_text_channel(
+        f"購入-{_channel_name_fragment(machine['name'])}"[:100],
+        category=category,
+        reason="キラ自販機 購入チャンネル作成",
+    )
+    machine["purchase_channel_id"] = channel.id
+    await persist_store()
+    return channel
+
+
+async def get_or_create_panel_channel(
+    guild: discord.Guild, machine_id: str
+) -> discord.TextChannel:
+    machine = get_machine(machine_id)
+    if not machine:
+        raise ValueError("自販機が見つかりません")
+    cid = int(machine.get("panel_channel_id", 0) or 0)
+    purchase_id = int(machine.get("purchase_channel_id", 0) or 0)
+    channel = guild.get_channel(cid) if cid else None
+    if isinstance(channel, discord.TextChannel) and channel.id != purchase_id:
+        return channel
+    category = discord.utils.get(guild.categories, name="📺 自販機パネル")
+    if category is None:
+        category = await guild.create_category("📺 自販機パネル", reason="キラ自販機 パネル設置")
+    channel = await guild.create_text_channel(
+        f"パネル-{_channel_name_fragment(machine['name'])}"[:100],
+        category=category,
+        reason="キラ自販機 パネルチャンネル作成",
+    )
+    machine["panel_channel_id"] = channel.id
+    machine["panel_message_id"] = 0
+    await persist_store()
+    return channel
+
+
+async def deploy_purchase_panel(
+    guild: discord.Guild, machine_id: str, channel: Optional[discord.TextChannel] = None
+) -> Optional[discord.Message]:
     machine = get_machine(machine_id)
     if not machine:
         return None
-    if channel is None:
-        cid = int(machine.get("panel_channel_id", 0) or 0)
-        ch = guild.get_channel(cid) if cid else None
-        channel = ch if isinstance(ch, discord.TextChannel) else None
-    if channel is None:
-        channel = guild.get_channel(int(machine.get("purchase_channel_id", 0) or 0))
-        if not isinstance(channel, discord.TextChannel):
-            channel = await guild.create_text_channel(f"購入-{machine['id']}", reason="キラ自販機購入チャンネル")
-        machine["purchase_channel_id"] = channel.id
+
+    purchase_channel = await get_or_create_purchase_channel(guild, machine_id)
+    if channel is not None and channel.id == purchase_channel.id:
+        raise ValueError("販売パネルと購入チャンネルは別のチャンネルにしてください。")
+    panel_channel = channel or await get_or_create_panel_channel(guild, machine_id)
+
     message_id = int(machine.get("panel_message_id", 0) or 0)
-    if message_id:
+    if message_id and int(machine.get("panel_channel_id", 0) or 0) == panel_channel.id:
         try:
-            old = await channel.fetch_message(message_id)
+            old = await panel_channel.fetch_message(message_id)
             await old.edit(embed=vending_embed(machine_id), view=PurchaseView(machine_id))
-            machine["panel_channel_id"] = channel.id
-            await persist_store()
             return old
-        except discord.NotFound:
+        except (discord.NotFound, discord.HTTPException):
             pass
-        except discord.HTTPException:
-            pass
-    message = await channel.send(embed=vending_embed(machine_id), view=PurchaseView(machine_id))
-    machine["panel_channel_id"] = channel.id
+
+    message = await panel_channel.send(embed=vending_embed(machine_id), view=PurchaseView(machine_id))
+    machine["panel_channel_id"] = panel_channel.id
     machine["panel_message_id"] = message.id
     get_store().add_log("panel_deploy", guild.me.id if guild.me else "bot", f"{machine_id} パネル設置")
     await persist_store()
     return message
-
-
-async def maybe_update_panel(machine_id: str) -> None:
-    guild_id = int(get_store().config.get("guild_id", 0) or 0)
-    guild = bot.get_guild(guild_id) if guild_id else None
-    if guild:
-        try:
-            await deploy_purchase_panel(guild, machine_id)
-        except Exception:
-            traceback.print_exc()
 
 
 async def refresh_all_purchase_panels() -> None:
@@ -2555,11 +2802,11 @@ async def refresh_all_purchase_panels() -> None:
 # Dedicated vending-panel editor
 # -----------------------------
 
-class VendingPanelHomeView(discord.ui.View):
+class VendingPanelHomeView(AdminKiraView):
     def __init__(self):
         super().__init__(timeout=300)
         options = [
-            discord.SelectOption(label=m["name"][:100], value=mid, description=f"ID: {mid}")
+            discord.SelectOption(label=m["name"][:100], value=mid)
             for mid, m in list(get_store().machines.items())[:25]
         ]
         if options:
@@ -2600,7 +2847,7 @@ def vending_panel_embed(machine_id: str) -> discord.Embed:
     return embed
 
 
-class VendingPanelView(discord.ui.View):
+class VendingPanelView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2619,10 +2866,7 @@ class VendingPanelView(discord.ui.View):
 
     @discord.ui.button(label="📎 写真追加", style=discord.ButtonStyle.success, row=0)
     async def photo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            f"📎 パネル写真は `/panel_photo` で追加できます。\n\n自販機: `{self.machine_id}`\nDiscordの添付欄へ画像をドラッグ＆ドロップしてください。",
-            ephemeral=True
-        )
+        await interaction.response.send_modal(PanelPhotoUploadModal(self.machine_id))
 
     @discord.ui.button(label="🎨 背景変更", style=discord.ButtonStyle.secondary, row=1)
     async def background(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2661,6 +2905,7 @@ class PanelTextModal(discord.ui.Modal, title="タイトル・説明を編集"):
         self.notice.default = d.get("notice", "")[:1200]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(
             self.machine_id,
             title=str(self.title_text.value or "キラの自動販売機"),
@@ -2671,7 +2916,7 @@ class PanelTextModal(discord.ui.Modal, title="タイトル・説明を編集"):
         get_store().add_log("panel_text", interaction.user.id, f"{self.machine_id} タイトル・説明更新")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+        await interaction.followup.send("✅ タイトル・説明を更新しました。", embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id), ephemeral=True)
 
 
 class PanelNewsModal(discord.ui.Modal, title="お知らせ"):
@@ -2683,14 +2928,15 @@ class PanelNewsModal(discord.ui.Modal, title="お知らせ"):
         self.news.default = get_machine(machine_id)["design"].get("news", "")[:900]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, news=str(self.news.value or ""))
         get_store().add_log("panel_news", interaction.user.id, f"{self.machine_id} お知らせ更新")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+        await interaction.followup.send("✅ お知らせを更新しました。", embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id), ephemeral=True)
 
 
-class VendingPanelColorView(discord.ui.View):
+class VendingPanelColorView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2708,11 +2954,12 @@ class VendingPanelColorSelect(discord.ui.Select):
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         get_store().update_machine_design(self.machine_id, color=self.values[0])
         get_store().add_log("panel_background", interaction.user.id, f"{self.machine_id}: {self.values[0]}")
         await persist_store()
         await maybe_update_panel(self.machine_id)
-        await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+        await interaction.followup.send("✅ 背景を変更しました。", embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id), ephemeral=True)
 
 
 class VendingPanelColorBack(discord.ui.Button):
@@ -2724,7 +2971,7 @@ class VendingPanelColorBack(discord.ui.Button):
         await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
 
 
-class VendingPanelPreviewView(discord.ui.View):
+class VendingPanelPreviewView(AdminKiraView):
     def __init__(self, machine_id: str):
         super().__init__(timeout=300)
         self.machine_id = machine_id
@@ -2734,57 +2981,31 @@ class VendingPanelPreviewView(discord.ui.View):
         await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
 
 
-class VendingPanelMessageChannelView(discord.ui.View):
+class VendingPanelMessageChannelView(AdminKiraView):
     def __init__(self, machine_id: str, guild: discord.Guild):
         super().__init__(timeout=300)
         self.machine_id = machine_id
-        options = [
-            discord.SelectOption(label=c.name[:100], value=str(c.id))
-            for c in guild.text_channels[:25]
-        ]
-        if options:
-            self.add_item(VendingPanelMessageChannelSelect(machine_id, options))
+        self.add_item(VendingPanelMessageChannelSelect(machine_id))
         self.add_item(VendingPanelMessageBack(machine_id))
 
 
-class VendingPanelMessageChannelSelect(discord.ui.Select):
-    def __init__(self, machine_id: str, options: list[discord.SelectOption]):
-        super().__init__(placeholder="送信先チャンネル", options=options, min_values=1, max_values=1)
+class VendingPanelMessageChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, machine_id: str):
+        super().__init__(
+            custom_id=f"kira:panel_message_channel:{machine_id}",
+            channel_types=[discord.ChannelType.text],
+            placeholder="メッセージを送るチャンネルを選択",
+            min_values=1,
+            max_values=1,
+        )
         self.machine_id = machine_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        channel = interaction.guild.get_channel(int(self.values[0]))
+        channel = self.values[0]
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("❌ チャンネルが見つかりません。", ephemeral=True)
+            await safe_interaction_message(interaction, "❌ テキストチャンネルを選択してください。")
             return
         await interaction.response.send_modal(PanelMessageModal(self.machine_id, channel.id, channel.name))
-
-
-class PanelMessageModal(discord.ui.Modal, title="メッセージ送信"):
-    content = discord.ui.TextInput(label="メッセージ", style=discord.TextStyle.paragraph, max_length=4000)
-
-    def __init__(self, machine_id: str, channel_id: int, channel_name: str):
-        super().__init__()
-        self.machine_id = machine_id
-        self.channel_id = channel_id
-        self.channel_name = channel_name
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        channel = interaction.guild.get_channel(self.channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("❌ チャンネルが見つかりません。", ephemeral=True)
-            return
-        try:
-            await channel.send(safe_text(str(self.content.value)))
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ Botにそのチャンネルへのメッセージ送信権限がありません。", ephemeral=True)
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message("❌ Discordへの送信に失敗しました。もう一度試してください。", ephemeral=True)
-            return
-        get_store().add_log("panel_message", interaction.user.id, f"#{self.channel_name} へ送信")
-        await persist_store()
-        await interaction.response.send_message(f"✅ #{self.channel_name} に送信しました。", ephemeral=True)
 
 
 class VendingPanelMessageBack(discord.ui.Button):
@@ -2794,6 +3015,40 @@ class VendingPanelMessageBack(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.edit_message(embed=vending_panel_embed(self.machine_id), view=VendingPanelView(self.machine_id))
+
+
+class PanelMessageModal(discord.ui.Modal, title="メッセージを送信"):
+    content = discord.ui.TextInput(
+        label="送信するメッセージ",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        required=True,
+        placeholder="お知らせや案内を入力してください。",
+    )
+
+    def __init__(self, machine_id: str, channel_id: int, channel_name: str):
+        super().__init__()
+        self.machine_id = machine_id
+        self.channel_id = channel_id
+        self.channel_name = channel_name
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel = interaction.guild.get_channel(self.channel_id) if interaction.guild else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.followup.send("❌ 送信先チャンネルが見つかりません。", ephemeral=True)
+            return
+        try:
+            await channel.send(safe_text(str(self.content.value or "")))
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Botにそのチャンネルへの送信権限がありません。", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Discordへの送信に失敗しました。", ephemeral=True)
+            return
+        get_store().add_log("panel_message", interaction.user.id, f"#{self.channel_name} へ送信")
+        await persist_store()
+        await interaction.followup.send(f"✅ **#{self.channel_name}** に送信しました。", ephemeral=True)
 
 
 def is_image_attachment(attachment: discord.Attachment) -> bool:
@@ -2812,6 +3067,9 @@ class AdminCog(commands.Cog):
         self.bot = bot_
 
     @app_commands.command(name="admin", description="管理パネルを開く")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @admin_only()
     async def admin(self, interaction: discord.Interaction):
         if not is_admin(interaction):
             await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
@@ -2819,6 +3077,9 @@ class AdminCog(commands.Cog):
         await interaction.response.send_message("🛠️ **キラの自動販売機 管理パネル**", view=AdminPanelView(), ephemeral=True)
 
     @app_commands.command(name="panel", description="自販機パネル専用編集画面を開く")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @admin_only()
     async def panel(self, interaction: discord.Interaction):
         if not is_admin(interaction):
             await interaction.response.send_message("管理者のみ使用できます。", ephemeral=True)
@@ -2830,86 +3091,124 @@ class AdminCog(commands.Cog):
         )
 
     @app_commands.command(name="setup_vending", description="自販機パネルを設置/更新")
-    @app_commands.describe(vending_id="自販機ID", channel="設置チャンネル")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(vending="自販機", channel="販売パネルを置くチャンネル")
+    @app_commands.autocomplete(vending=machine_autocomplete_for_interaction)
     @admin_only()
-    async def setup_vending(self, interaction: discord.Interaction, vending_id: str, channel: Optional[discord.TextChannel] = None):
-        machine = get_machine(vending_id)
+    async def setup_vending(self, interaction: discord.Interaction, vending: str, channel: Optional[discord.TextChannel] = None):
+        machine = get_machine(vending)
         if not machine:
-            await interaction.response.send_message("❌ 自販機が見つかりません。", ephemeral=True)
+            await interaction.response.send_message("❌ 自販機を選択してください。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        await deploy_purchase_panel(interaction.guild, vending_id, channel)
-        await interaction.followup.send("✅ パネルを設置/更新しました。", ephemeral=True)
+        try:
+            await deploy_purchase_panel(interaction.guild, vending, channel)
+            await interaction.followup.send("✅ 販売パネルを設置/更新しました。購入チャンネルとは別管理です。", ephemeral=True)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
     @app_commands.command(name="send_message", description="指定チャンネルへメッセージ送信")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(channel="送信先", content="内容")
     @admin_only()
     async def send_message(self, interaction: discord.Interaction, channel: discord.TextChannel, content: str):
-        await channel.send(safe_text(content))
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await channel.send(safe_text(content))
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Botにそのチャンネルへの送信権限がありません。", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.followup.send("❌ Discordへの送信に失敗しました。", ephemeral=True)
+            return
         get_store().add_log("send_message", interaction.user.id, f"#{channel.name} へ送信")
         await persist_store()
-        await interaction.response.send_message(f"✅ {channel.mention} に送信しました。", ephemeral=True)
+        await interaction.followup.send(f"✅ {channel.mention} に送信しました。", ephemeral=True)
 
     @app_commands.command(name="product_add", description="商品を追加")
-    @app_commands.describe(vending_id="自販機ID", name="商品名", price="価格", stock="在庫")
+    @app_commands.autocomplete(vending=machine_autocomplete_for_interaction)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(vending="自販機", name="商品名", price="価格", stock="在庫")
     @admin_only()
-    async def product_add(self, interaction: discord.Interaction, vending_id: str, name: str, price: int, stock: int):
-        if not get_machine(vending_id):
-            await interaction.response.send_message("❌ 自販機が見つかりません。", ephemeral=True)
+    async def product_add(self, interaction: discord.Interaction, vending: str, name: str, price: int, stock: int):
+        if not get_machine(vending):
+            await interaction.response.send_message("❌ 自販機を選択してください。", ephemeral=True)
             return
         try:
-            p = get_store().add_product(vending_id, {"name": name, "price": price, "stock": stock})
-            get_store().add_log("product_add", interaction.user.id, f"{vending_id}/{p['id']}")
+            await interaction.response.defer(ephemeral=True)
+            p = get_store().add_product(vending, {"name": name, "price": price, "stock": stock})
+            get_store().add_log("product_add", interaction.user.id, f"{vending}/{p['id']}")
             await persist_store()
-            await maybe_update_panel(vending_id)
-            await interaction.response.send_message(f"✅ 商品 `{p['name']}` を追加しました。", ephemeral=True)
+            await maybe_update_panel(vending)
+            await interaction.followup.send(f"✅ 商品 `{p['name']}` を追加しました。", ephemeral=True)
         except ValueError:
-            await interaction.response.send_message("❌ 価格・在庫を確認してください。", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ 価格・在庫を確認してください。", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ 価格・在庫を確認してください。", ephemeral=True)
 
     @app_commands.command(name="product_image", description="商品画像をファイル添付で設定")
-    @app_commands.describe(vending_id="自販機ID", product_id="商品ID", image="設定する画像（そのままドラッグ＆ドロップ）")
+    @app_commands.autocomplete(vending=machine_autocomplete_for_interaction, product=product_autocomplete_for_interaction)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(vending="自販機", product="商品", image="設定する画像（そのままドラッグ＆ドロップ）")
     @admin_only()
-    async def product_image(self, interaction: discord.Interaction, vending_id: str, product_id: str, image: discord.Attachment):
-        p = get_store().machine_products(vending_id).get(product_id)
+    async def product_image(self, interaction: discord.Interaction, vending: str, product: str, image: discord.Attachment):
+        p = get_store().machine_products(vending).get(product)
         if not p:
             await interaction.response.send_message("❌ 商品が見つかりません。", ephemeral=True)
             return
         if not is_image_attachment(image):
             await interaction.response.send_message("❌ PNG / JPG / GIF / WEBP などの画像ファイルを指定してください。", ephemeral=True)
             return
-        get_store().edit_product(vending_id, product_id, image_url=image.url)
-        get_store().add_log("product_image", interaction.user.id, f"{vending_id}/{product_id} 添付: {image.filename}")
+        await interaction.response.defer(ephemeral=True)
+        get_store().edit_product(vending, product, image_url=image.url)
+        get_store().add_log("product_image", interaction.user.id, f"{vending}/{product} 添付: {image.filename}")
         await persist_store()
-        await maybe_update_panel(vending_id)
-        await interaction.response.send_message("✅ 商品画像を設定しました。画像ファイルはドラッグ＆ドロップだけでOKです。", ephemeral=True)
+        await maybe_update_panel(vending)
+        await interaction.followup.send("✅ 商品画像を設定しました。", ephemeral=True)
 
     @app_commands.command(name="panel_photo", description="自販機パネル写真をファイル添付で設定")
-    @app_commands.describe(vending_id="自販機ID", image="パネル写真（そのままドラッグ＆ドロップ）")
+    @app_commands.autocomplete(vending=machine_autocomplete_for_interaction)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(vending="自販機", image="パネル写真（そのままドラッグ＆ドロップ）")
     @admin_only()
-    async def panel_photo(self, interaction: discord.Interaction, vending_id: str, image: discord.Attachment):
-        machine = get_machine(vending_id)
+    async def panel_photo(self, interaction: discord.Interaction, vending: str, image: discord.Attachment):
+        machine = get_machine(vending)
         if not machine:
             await interaction.response.send_message("❌ 自販機が見つかりません。", ephemeral=True)
             return
         if not is_image_attachment(image):
             await interaction.response.send_message("❌ 画像ファイルを指定してください。", ephemeral=True)
             return
-        get_store().update_machine_design(vending_id, banner_url=image.url)
-        get_store().add_log("panel_photo", interaction.user.id, f"{vending_id} パネル写真: {image.filename}")
+        await interaction.response.defer(ephemeral=True)
+        get_store().update_machine_design(vending, banner_url=image.url)
+        get_store().add_log("panel_photo", interaction.user.id, f"{vending} パネル写真: {image.filename}")
         await persist_store()
-        await maybe_update_panel(vending_id)
-        await interaction.response.send_message("✅ パネル写真を設定しました。", ephemeral=True)
+        await maybe_update_panel(vending)
+        await interaction.followup.send("✅ パネル写真を設定しました。", ephemeral=True)
 
     @app_commands.command(name="history", description="自分の購入履歴")
+    @app_commands.guild_only()
     async def history(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=history_embed(interaction.user.id), view=HistoryView(interaction.user.id), ephemeral=True)
 
     @app_commands.command(name="ranking", description="人気商品ランキング")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @admin_only()
     async def ranking(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=ranking_embed(), view=RankingView(), ephemeral=True)
 
     @app_commands.command(name="product_search", description="商品を検索")
-    @app_commands.describe(keyword="商品名・カテゴリー・商品IDで検索")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(keyword="商品名・カテゴリーで検索")
+    @admin_only()
     async def product_search(self, interaction: discord.Interaction, keyword: str):
         q = str(keyword or "").strip().lower()
         embed = discord.Embed(title="🔎 商品検索", color=discord.Color.blurple())
@@ -2931,6 +3230,8 @@ class AdminCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="coupon_create", description="クーポンを作成")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(code="コード", kind="percent または fixed", amount="割引値", max_uses="最大利用回数(0=無制限)", expires_hours="期限時間(0=無期限)")
     @admin_only()
     async def coupon_create(self, interaction: discord.Interaction, code: str, kind: str, amount: int, max_uses: int = 0, expires_hours: int = 0):
@@ -2944,6 +3245,8 @@ class AdminCog(commands.Cog):
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
     @app_commands.command(name="coupon_delete", description="クーポンを削除")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @admin_only()
     async def coupon_delete(self, interaction: discord.Interaction, code: str):
         if not get_store().delete_coupon(code):
@@ -2954,37 +3257,47 @@ class AdminCog(commands.Cog):
         await interaction.response.send_message("✅ 削除しました。", ephemeral=True)
 
     @app_commands.command(name="coupon_list", description="クーポン一覧")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @admin_only()
     async def coupon_list(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=coupon_list_embed(), ephemeral=True)
 
     @app_commands.command(name="stats", description="売上統計")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @admin_only()
     async def stats(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=stats_embed(), ephemeral=True)
 
     @app_commands.command(name="order", description="注文番号を詳細表示")
-    @app_commands.describe(order_id="注文番号")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(order="注文")
+    @app_commands.autocomplete(order=order_autocomplete)
     @admin_only()
-    async def order(self, interaction: discord.Interaction, order_id: str):
-        o = get_store().get_order(order_id)
+    async def order(self, interaction: discord.Interaction, order: str):
+        o = get_store().get_order(order)
         if not o:
             await interaction.response.send_message("❌ 注文が見つかりません。", ephemeral=True)
             return
         await interaction.response.send_message(embed=order_embed(o, get_machine(o["vending_id"])), ephemeral=True)
 
     @app_commands.command(name="maintenance", description="自販機をメンテナンスモード切替")
-    @app_commands.describe(vending_id="自販機ID")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(vending="自販機")
+    @app_commands.autocomplete(vending=machine_autocomplete_for_interaction)
     @admin_only()
-    async def maintenance(self, interaction: discord.Interaction, vending_id: str):
-        machine = get_machine(vending_id)
+    async def maintenance(self, interaction: discord.Interaction, vending: str):
+        machine = get_machine(vending)
         if not machine:
             await interaction.response.send_message("❌ 自販機が見つかりません。", ephemeral=True)
             return
         machine["design"]["maintenance"] = not bool(machine["design"].get("maintenance"))
-        get_store().add_log("maintenance_toggle", interaction.user.id, f"{vending_id}: {machine['design']['maintenance']}")
+        get_store().add_log("maintenance_toggle", interaction.user.id, f"{vending}: {machine['design']['maintenance']}")
         await persist_store()
-        await maybe_update_panel(vending_id)
+        await maybe_update_panel(vending)
         await interaction.response.send_message(f"✅ メンテナンス: `{machine['design']['maintenance']}`", ephemeral=True)
 
 
@@ -3038,6 +3351,17 @@ class KiraBot(commands.Bot):
 
 
 bot = KiraBot()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[COMMAND ERROR] {error!r}")
+    traceback.print_exc()
+    if isinstance(error, app_commands.CheckFailure):
+        message = "❌ この機能は管理者のみ使用できます。"
+    else:
+        message = "❌ コマンドの処理中にエラーが発生しました。もう一度お試しください。"
+    await safe_interaction_message(interaction, message)
 
 
 @bot.event
