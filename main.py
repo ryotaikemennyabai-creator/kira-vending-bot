@@ -989,7 +989,7 @@ def product_embed(machine_id: str, product_id: str, coupon_code: str = "") -> di
     return embed
 
 
-def machine_autocomplete(current: str) -> list[app_commands.Choice[str]]:
+async def machine_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     query = (current or "").lower().strip()
     choices = []
     for mid, m in get_store().machines.items():
@@ -999,7 +999,7 @@ def machine_autocomplete(current: str) -> list[app_commands.Choice[str]]:
     return choices[:25]
 
 
-def product_autocomplete(machine_id: str, current: str) -> list[app_commands.Choice[str]]:
+async def product_autocomplete(machine_id: str, current: str) -> list[app_commands.Choice[str]]:
     query = (current or "").lower().strip()
     choices = []
     for pid, p in get_store().machine_products(machine_id).items():
@@ -1007,6 +1007,15 @@ def product_autocomplete(machine_id: str, current: str) -> list[app_commands.Cho
         if not query or query in label.lower() or query in str(p.get("category", "")).lower():
             choices.append(app_commands.Choice(name=label[:100], value=pid))
     return choices[:25]
+
+
+async def product_autocomplete_for_interaction(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    vending = getattr(interaction.namespace, "vending", "")
+    if hasattr(vending, "value"):
+        vending = vending.value
+    if not vending:
+        return []
+    return await product_autocomplete(str(vending), current)
 
 
 # -----------------------------
@@ -1332,18 +1341,15 @@ class PayPayModal(discord.ui.Modal, title="PayPayお支払い"):
         self.coupon_code = coupon_code
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         url = str(self.paypay_url.value or "").strip()
         if not valid_http_url(url):
-            await interaction.response.send_message("❌ 正しいhttp/httpsのURLを入力してください。", ephemeral=True)
+            await interaction.followup.send("❌ 正しいhttp/httpsのURLを入力してください。", ephemeral=True)
             return
         try:
-            await interaction.response.defer(ephemeral=True)
             order = await reserve_order(interaction.user.id, self.machine_id, self.product_id, self.coupon_code, url)
         except ValueError as e:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ {e}", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         await notify_order(interaction.guild, order)
         await purchase_animation(interaction, order, already_deferred=True)
@@ -1753,8 +1759,8 @@ class MachineCreateModal(discord.ui.Modal, title="自販機を作成"):
     name = discord.ui.TextInput(label="自販機名", placeholder="例: ゲーム自販機", max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        store = get_store()
         await interaction.response.defer(ephemeral=True)
+        store = get_store()
         try:
             async with DATA_LOCK:
                 machine = store.create_machine(str(self.name.value))
@@ -2055,6 +2061,7 @@ class ProductAddModal(discord.ui.Modal, title="商品を追加"):
         self.machine_id = machine_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         try:
             price = int(self.price.value)
             stock = int(self.stock.value)
@@ -2077,9 +2084,12 @@ class ProductAddModal(discord.ui.Modal, title="商品を追加"):
                 save_json(CONFIG_FILE, get_store().dump_config())
                 save_json(PRODUCTS_FILE, get_store().dump_products())
                 save_json(LOGS_FILE, get_store().dump_logs())
-            await interaction.response.edit_message(embed=product_detail_admin_embed(self.machine_id, product["id"]), view=ProductEditView(self.machine_id, product["id"]))
+            await interaction.edit_original_response(embed=product_detail_admin_embed(self.machine_id, product["id"]), view=ProductEditView(self.machine_id, product["id"]))
         except (ValueError, KeyError) as e:
-            await interaction.response.send_message(f"❌ 入力を確認してください。{e}", ephemeral=True)
+            await interaction.followup.send(f"❌ 入力を確認してください。{e}", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ 商品の追加に失敗しました。", ephemeral=True)
 
 
 def product_detail_admin_embed(machine_id: str, product_id: str) -> discord.Embed:
@@ -2112,6 +2122,10 @@ class ProductEditView(discord.ui.View):
     @discord.ui.button(label="📎 画像を追加", style=discord.ButtonStyle.secondary, row=0)
     async def image(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ProductImageUploadModal(self.machine_id, self.product_id))
+
+    @discord.ui.button(label="🔢 1日上限", style=discord.ButtonStyle.secondary, row=0)
+    async def purchase_limit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PurchaseLimitModal(self.machine_id, self.product_id))
 
     @discord.ui.button(label="🔄 販売ON/OFF", style=discord.ButtonStyle.secondary, row=1)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2146,7 +2160,6 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
     description = discord.ui.TextInput(label="説明", style=discord.TextStyle.paragraph, required=False, max_length=1000)
     emoji = discord.ui.TextInput(label="絵文字", max_length=32, required=False)
     category = discord.ui.TextInput(label="カテゴリー", max_length=50, required=False)
-    purchase_limit = discord.ui.TextInput(label="1日の購入上限", placeholder="0=無制限", max_length=10, required=False)
 
     def __init__(self, machine_id: str, product_id: str):
         super().__init__()
@@ -2158,14 +2171,12 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
         self.description.default = p.get("description", "")
         self.emoji.default = p.get("emoji", "📦")
         self.category.default = p.get("category", "その他")
-        self.purchase_limit.default = str(p.get("purchase_limit", 0) or 0)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
             price = int(self.price.value)
-            limit = int(self.purchase_limit.value or 0)
-            if price < 0 or limit < 0:
+            if price < 0:
                 raise ValueError
             get_store().edit_product(
                 self.machine_id,
@@ -2175,7 +2186,6 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
                 description=str(self.description.value or ""),
                 emoji=str(self.emoji.value or "📦"),
                 category=str(self.category.value or "その他"),
-                purchase_limit=limit,
             )
             get_store().add_log("product_edit", interaction.user.id, f"{self.machine_id}/{self.product_id} を編集")
             await persist_store()
@@ -2186,6 +2196,35 @@ class ProductEditModal(discord.ui.Modal, title="商品を編集"):
         except Exception:
             traceback.print_exc()
             await interaction.followup.send("❌ 商品の編集に失敗しました。", ephemeral=True)
+
+
+class PurchaseLimitModal(discord.ui.Modal, title="1日の購入上限"):
+    purchase_limit = discord.ui.TextInput(label="1日の購入上限", placeholder="0=無制限", max_length=10, required=True)
+
+    def __init__(self, machine_id: str, product_id: str):
+        super().__init__()
+        self.machine_id = machine_id
+        self.product_id = product_id
+        self.purchase_limit.default = str(get_store().machine_products(machine_id)[product_id].get("purchase_limit", 0) or 0)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            value = int(self.purchase_limit.value)
+            if value < 0:
+                raise ValueError
+            get_store().edit_product(self.machine_id, self.product_id, purchase_limit=value)
+            get_store().add_log("purchase_limit_change", interaction.user.id, f"{self.machine_id}/{self.product_id}: {value}")
+            await persist_store()
+            await interaction.edit_original_response(
+                embed=product_detail_admin_embed(self.machine_id, self.product_id),
+                view=ProductEditView(self.machine_id, self.product_id),
+            )
+        except (ValueError, KeyError):
+            await interaction.followup.send("❌ 0以上の数字を入力してください。", ephemeral=True)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("❌ 1日の購入上限の変更に失敗しました。", ephemeral=True)
 
 
 class StockModal(discord.ui.Modal, title="在庫変更"):
@@ -2293,10 +2332,10 @@ class ProductDeleteModal(discord.ui.Modal, title="商品削除"):
         self.product_id = product_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if str(self.confirm.value).strip().upper() != "DELETE":
-            await interaction.response.send_message("❌ `DELETE` と入力してください。", ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True)
+        if str(self.confirm.value).strip().upper() != "DELETE":
+            await interaction.followup.send("❌ `DELETE` と入力してください。", ephemeral=True)
+            return
         if not get_store().delete_product(self.machine_id, self.product_id):
             await interaction.followup.send("❌ 商品が見つからないか、支払い確認待ちの注文があります。", ephemeral=True)
             return
